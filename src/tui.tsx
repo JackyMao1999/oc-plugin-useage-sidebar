@@ -245,6 +245,7 @@ interface Strings {
   inUse: string
   configured: string
   notConfigured: string
+  noActiveProvider: string
   plan: string
   balance: string
 }
@@ -273,6 +274,7 @@ function makeStrings(lang: Lang): Strings {
         inUse: "使用中",
         configured: "已配置",
         notConfigured: "未配置",
+        noActiveProvider: "未检测到使用中的提供商",
         plan: "计划",
         balance: "余额",
       }
@@ -298,6 +300,7 @@ function makeStrings(lang: Lang): Strings {
         inUse: "In use",
         configured: "Configured",
         notConfigured: "Not configured",
+        noActiveProvider: "No provider in use",
         plan: "Plan",
         balance: "Balance",
       }
@@ -451,67 +454,45 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
     }
   }
 
-  // activeProviderIds : 当前会话实际在用的 provider
-  //   同时收集两层：
-  //   1. 传输层 —— 最近 assistant 消息的 providerID（如 "opencode-go" → Go 计划）
-  //   2. 模型层 —— session.model.providerID（如 "deepseek" → DeepSeek 模型）
-  const activeProviderIds = createMemo(() => {
-    const ids = new Set<string>()
-    if (!props.api.state?.ready || !props.sessionId) return ids
+  // activeProviderId : 当前会话正在使用的提供商（只会有一个）
+  //   优先用 session.model.providerID —— 即 /models 里当前模型所属的提供商；
+  //   会话模型还没建立时，回退到最近一条 assistant 消息的 providerID
+  const activeProviderId = createMemo(() => {
+    if (!props.api.state?.ready || !props.sessionId) return undefined
     try {
-      const msgs = props.api.state.session.messages(props.sessionId)
-      for (const m of msgs) {
-        if ((m as any).role === "assistant" && (m as any).providerID) {
-          ids.add((m as any).providerID)
-        }
-      }
       const s = props.api.state.session.get(props.sessionId)
-      if (s?.model?.providerID) ids.add(s.model.providerID)
+      if (s?.model?.providerID) return s.model.providerID
+      const msgs = props.api.state.session.messages(props.sessionId)
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i] as any
+        if (m.role === "assistant" && m.providerID) return m.providerID
+      }
     } catch {
       // 会话尚未加载完时忽略
     }
-    return ids
+    return undefined
   })
 
-  // knownProviders : 提供商列表 + 状态
-  //   active     : 当前会话正在使用的 provider（accent 高亮）
-  //   configured : auth.json 里有没有这个 provider 的 key
-  //   pu         : 数据文件里有该 provider 的用量数据（有则显示明细）
-  //   筛选规则：检测到当前使用的提供商时，只显示它（用哪个就显示哪个）；
-  //   新会话还没回复（检测不到）时，回退显示已配置/有数据的提供商
+  // knownProviders : 提供商列表 —— 只包含当前正在使用的那个提供商
+  //   用哪个模型就显示哪个提供商（切换模型后自动变化）
   const knownProviders = createMemo(() => {
+    const id = activeProviderId()
+    if (!id) return []
     const puMap = providers()
     const keys = readAuthKeys()
-    const activeIds = activeProviderIds()
-    const list: Array<ProviderMeta & { active: boolean; configured: boolean; pu?: ProviderUsage }> =
-      PROVIDER_META.map((m) => ({
-        ...m,
-        active: activeIds.has(m.id),
-        configured: Boolean(keys[m.id]),
-        pu: puMap[m.id],
-      }))
-    // 数据文件里出现但不在热门列表里的 provider，也列出来
-    for (const id of Object.keys(puMap)) {
-      if (!PROVIDER_META.some((m) => m.id === id)) {
-        list.push({
-          id,
-          name: DISPLAY_NAMES[id] || id,
-          color: "#94a3b8",
-          glyph: "●",
-          active: activeIds.has(id),
-          configured: Boolean(keys[id]),
-          pu: puMap[id],
-        })
-      }
-    }
-    // 有活跃提供商：只显示活跃的；否则显示已配置或有数据的
-    const activeList = list.filter((p) => p.active)
-    if (activeList.length > 0) return activeList
-    return list.filter((p) => p.configured || p.pu)
+    const meta = PROVIDER_META.find((m) => m.id === id)
+    return [
+      {
+        id,
+        name: meta?.name ?? DISPLAY_NAMES[id] ?? id,
+        color: meta?.color ?? "#94a3b8",
+        glyph: meta?.glyph ?? "●",
+        active: true,
+        configured: Boolean(keys[id]),
+        pu: puMap[id],
+      },
+    ]
   })
-
-  // hasActiveProvider : 是否检测到当前使用的提供商（新会话还没回复时可能为空）
-  const hasActiveProvider = createMemo(() => activeProviderIds().size > 0)
 
   // goUsage : 优先用官方 API 的实时数据，其次用 JSON 文件里缓存的 goApi，都没有才回退 goWindows
   const goUsage = createMemo(() => {
@@ -752,7 +733,7 @@ return (
           </box>
           <Show when={openProviders()}>
             <Show when={knownProviders().length === 0}>
-              <text fg={theme().textMuted} paddingLeft={2}>{t.noneConfigured}</text>
+              <text fg={theme().textMuted} paddingLeft={2}>{t.noActiveProvider}</text>
             </Show>
             <For each={knownProviders()}>
               {(p) => (
@@ -768,9 +749,8 @@ return (
                       {p.active ? t.inUse : p.configured ? t.configured : t.notConfigured}
                     </text>
                   </box>
-                  {/* 只有当前使用的提供商显示明细；
-                新会话还没回复（检测不到活跃提供商）时回退为全部显示 */}
-                  <Show when={(p.active || !hasActiveProvider()) && (p.pu || (p.id === "opencode-go" && goUsage()))}>
+                  {/* 当前使用的提供商显示明细 */}
+                  <Show when={p.pu || (p.id === "opencode-go" && goUsage())}>
                     {ProviderDetails(p.id, p.pu)}
                   </Show>
                 </box>
