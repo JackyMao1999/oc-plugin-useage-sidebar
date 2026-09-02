@@ -6,9 +6,10 @@ AI model usage monitoring plugin for [opencode](https://opencode.ai). Tracks ses
 
 ## Features
 
-- **Usage tracking** — monitors sessions, tool calls, file edits, and errors
-- **Period aggregation** — stats by today, week, month, or rolling 30 days
-- **Provider quota** — optionally connects to OpenAI/Anthropic billing APIs for real cost and limit data
+- **Session cache hit rate** — live `cache read / (input + read)` for the current session (Hit rate, Input, Read, Write)
+- **Go plan usage** — official API percent windows (rolling 5h / weekly / monthly) with reset countdown
+- **ChatGPT usage** — reads the ChatGPT backend (`chatgpt.com/backend-api/wham/usage`, same source as the Codex Cloud analytics page) for plan type, 5h/weekly rate-limit windows, and credit balance. Works with the standard OpenAI OAuth login — no API key needed; the access token is refreshed automatically
+- **Provider quota (optional)** — connects to OpenAI/Anthropic billing APIs for real cost and limit data
 - **AI callable** — the `usage_stats` tool lets the model report usage when asked
 - **Toast alerts** — warns at configurable threshold (default 80%) when approaching a provider limit
 - **JSON persistence** — data stored at `~/.opencode/oc-plugin-usage-data.json`

@@ -115,6 +115,18 @@ interface GoApiUsage {
   lastChecked?: string
 }
 
+// ChatGptUsage: ChatGPT (chatgpt.com) 用量 —— 来自 backend-api/wham/usage
+//   primary   : 5 小时窗口
+//   secondary : 每周窗口
+//   credits   : 余额（美元）
+interface ChatGptUsage {
+  planType?: string
+  primary: GoApiWindow
+  secondary: GoApiWindow
+  credits?: number
+  lastChecked?: string
+}
+
 // ProviderUsage: 一个 AI 服务提供商的使用数据
 // 例如 "openai"（OpenAI）、"anthropic"（Anthropic）、"opencode-go"（Go）
 // 问号（?）表示这个字段可以不存在（可选字段）
@@ -128,6 +140,7 @@ interface ProviderUsage {
   recentEvents?: Array<{ time: number; cost: number }>    // 最近的事件列表（用于计算 rolling 5h）
   goWindows?: GoWindows                                    // Go 的三窗口数据（只有 Go provider 会有）
   goApi?: GoApiUsage                                       // Go 官方 API 数据（percent + resetsAt）
+  chatgpt?: ChatGptUsage                                   // ChatGPT 用量数据（wham/usage）
 }
 
 // DayStats: 某一天的使用统计
@@ -232,6 +245,8 @@ interface Strings {
   inUse: string
   configured: string
   notConfigured: string
+  plan: string
+  balance: string
 }
 
 function makeStrings(lang: Lang): Strings {
@@ -258,6 +273,8 @@ function makeStrings(lang: Lang): Strings {
         inUse: "使用中",
         configured: "已配置",
         notConfigured: "未配置",
+        plan: "计划",
+        balance: "余额",
       }
     : {
         usage: "Usage",
@@ -281,6 +298,8 @@ function makeStrings(lang: Lang): Strings {
         inUse: "In use",
         configured: "Configured",
         notConfigured: "Not configured",
+        plan: "Plan",
+        balance: "Balance",
       }
 }
 
@@ -413,7 +432,9 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   // providers : 所有 Provider 的用量数据
   const providers = createMemo(() => data().providerUsage)
 
-  // readAuthKeys: 从 auth.json 读取哪些 provider 已经登录（有 API key）
+  // readAuthKeys: 从 auth.json 读取哪些 provider 已经登录
+  //   API key 型：有 key 字段就算已配置
+  //   OAuth 型（如 openai 的 ChatGPT 登录）：有 refresh token 就算已配置
   const readAuthKeys = (): Record<string, boolean> => {
     try {
       const authPath = join(homedir(), ".local", "share", "opencode", "auth.json")
@@ -421,7 +442,8 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
       const auth = JSON.parse(readFileSync(authPath, "utf-8"))
       const out: Record<string, boolean> = {}
       for (const [id, v] of Object.entries(auth)) {
-        out[id] = Boolean((v as any)?.key)
+        const entry = v as any
+        out[id] = Boolean(entry?.key) || (entry?.type === "oauth" && Boolean(entry?.refresh))
       }
       return out
     } catch {
@@ -648,6 +670,18 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
 
       <Show when={id !== "opencode-go" && pu?.cost != null}>
         {InfoRow(t.cost, `$${pu!.cost!.toFixed(2)}`)}
+      </Show>
+
+      {/* ChatGPT（wham/usage）：计划 + 5小时/每周窗口 + 余额 */}
+      <Show when={id === "openai" && pu?.chatgpt}>
+        <Show when={pu!.chatgpt!.planType}>
+          {InfoRow(t.plan, pu!.chatgpt!.planType!)}
+        </Show>
+        {GoWindowPercent(t.rolling5h, pu!.chatgpt!.primary)}
+        {GoWindowPercent(t.weekly, pu!.chatgpt!.secondary)}
+        <Show when={pu!.chatgpt!.credits != null}>
+          {InfoRow(t.balance, `$${pu!.chatgpt!.credits!.toFixed(2)}`)}
+        </Show>
       </Show>
 
       <Show when={id !== "opencode-go" && pu?.limit != null && pu!.limit! > 0 && pu?.cost != null}>

@@ -8,6 +8,7 @@
 
 - **会话缓存命中率** — 实时统计当前会话的 `cache read / (input + read)`，显示 Hit rate、Input、Read、Write
 - **Go 套餐用量** — 通过官方 API 显示 Rolling 5h / Weekly / Monthly 的已用百分比 + 重置倒计时（超过 24 小时自动显示为天）
+- **ChatGPT 用量** — 读取 ChatGPT 后台接口（`chatgpt.com/backend-api/wham/usage`，与 Codex Cloud 分析页同源），显示计划类型、5小时/每周限额窗口和余额；用标准 OpenAI OAuth 登录即可，无需 API key，access token 自动刷新
 - **Provider 配额（可选）** — 连接 OpenAI/Anthropic 计费 API，显示真实费用和限额
 - **AI 可调用** — `usage_stats` 工具可让模型在收到询问时报告用量
 - **Toast 提醒** — 接近限额时弹出警告（默认阈值 80%）

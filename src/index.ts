@@ -83,6 +83,16 @@ interface ProviderUsage {
   recentEvents?: Array<{ time: number; cost: number }>;
   goWindows?: GoWindows;
   goApi?: GoApiUsage;
+  chatgpt?: ChatGptUsage;
+}
+
+// ChatGPT (chatgpt.com) 用量 —— 来自 backend-api/wham/usage
+interface ChatGptUsage {
+  planType?: string;
+  primary: GoApiWindow;    // 5 小时窗口
+  secondary: GoApiWindow;  // 每周窗口
+  credits?: number;        // 余额（美元）
+  lastChecked?: string;
 }
 
 const GO_LIMITS = {
@@ -145,6 +155,69 @@ async function checkGoUsage(apiKey: string): Promise<GoApiUsage | null> {
       rolling: { status: u.rolling.status, percent: u.rolling.percent, resetsAt: u.rolling.resetsAt },
       weekly: { status: u.weekly.status, percent: u.weekly.percent, resetsAt: u.weekly.resetsAt },
       monthly: { status: u.monthly.status, percent: u.monthly.percent, resetsAt: u.monthly.resetsAt },
+      lastChecked: new Date().toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ChatGPT OAuth 客户端 ID（与 Codex CLI 一致，用于刷新 access token）
+const CHATGPT_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+// 内存中缓存的 ChatGPT access token（不写回 auth.json，避免和 opencode 的 token 管理冲突）
+let chatGptToken: { access: string; expires: number } | null = null;
+
+async function refreshChatGptToken(refresh: string): Promise<{ access: string; expires: number } | null> {
+  try {
+    const resp = await fetch("https://auth.openai.com/oauth/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(refresh)}&client_id=${CHATGPT_OAUTH_CLIENT_ID}`,
+    });
+    if (!resp.ok) return null;
+    const json: any = await resp.json();
+    if (!json?.access_token) return null;
+    return { access: json.access_token, expires: Date.now() + (json.expires_in || 3600) * 1000 };
+  } catch {
+    return null;
+  }
+}
+
+// 查询 ChatGPT 用量（chatgpt.com 后台的 wham/usage，与 Codex Cloud 分析页同一数据源）
+async function checkChatGPTUsage(): Promise<ChatGptUsage | null> {
+  try {
+    const authPath = join(homedir(), ".local", "share", "opencode", "auth.json");
+    if (!existsSync(authPath)) return null;
+    const auth = JSON.parse(readFileSync(authPath, "utf-8"));
+    const oa = auth["openai"];
+    if (!oa?.refresh || !oa?.accountId) return null;
+
+    // token 过期前 5 分钟提前刷新
+    if (!chatGptToken || chatGptToken.expires < Date.now() + 5 * 60 * 1000) {
+      chatGptToken = await refreshChatGptToken(oa.refresh);
+      if (!chatGptToken) return null;
+    }
+
+    const resp = await fetch("https://chatgpt.com/backend-api/wham/usage", {
+      headers: {
+        Authorization: `Bearer ${chatGptToken.access}`,
+        "ChatGPT-Account-Id": oa.accountId,
+      },
+    });
+    if (!resp.ok) return null;
+    const json: any = await resp.json();
+    const rl = json?.rate_limit;
+    if (!rl?.primary_window) return null;
+    const window = (x: any): GoApiWindow => ({
+      percent: x?.used_percent ?? 0,
+      resetsAt: x?.reset_at ? new Date((x.reset_at as number) * 1000).toISOString() : undefined,
+    });
+    return {
+      planType: json?.plan_type,
+      primary: window(rl.primary_window),
+      secondary: window(rl.secondary_window),
+      credits: json?.credits?.has_credits ? parseFloat(json.credits.balance) : undefined,
       lastChecked: new Date().toISOString(),
     };
   } catch {
@@ -301,6 +374,14 @@ function formatStats(stats: ReturnType<typeof aggregate>, period: string): strin
 
 function formatProviderUsage(pu: ProviderUsage, label: string): string {
   const lines: string[] = [`--- ${label} ---`];
+  if (pu.chatgpt) {
+    const fmt = (w: GoApiWindow) =>
+      `${w.percent.toFixed(1)}% used${w.resetsAt ? ` (resets ${new Date(w.resetsAt).toLocaleString()})` : ""}`;
+    if (pu.chatgpt.planType) lines.push(`  Plan:       ${pu.chatgpt.planType}`);
+    lines.push(`  5h:         ${fmt(pu.chatgpt.primary)}`);
+    lines.push(`  Weekly:     ${fmt(pu.chatgpt.secondary)}`);
+    if (pu.chatgpt.credits != null) lines.push(`  Balance:    $${pu.chatgpt.credits.toFixed(2)}`);
+  }
   if (pu.goApi) {
     const fmt = (w: GoApiWindow) =>
       `${w.percent.toFixed(1)}% used${w.resetsAt ? ` (resets ${new Date(w.resetsAt).toLocaleString()})` : ""}`;
@@ -500,6 +581,23 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
     pollGo();
     setInterval(pollGo, CONFIG.providerCheckIntervalMs);
   }
+
+  // ChatGPT 用量轮询（OAuth 登录，无需 API key）
+  const pollChatGpt = async () => {
+    const usage = await checkChatGPTUsage();
+    if (!usage) return;
+    const pu = data.providerUsage["openai"] || { lastChecked: new Date().toISOString() };
+    pu.chatgpt = usage;
+    data.providerUsage["openai"] = pu;
+    markDirty();
+    for (const [name, w] of Object.entries({ "5h": usage.primary, Weekly: usage.secondary })) {
+      if (w.percent >= thresholdPct) {
+        await tryShowToast(ctx, `ChatGPT ${name}: ${w.percent.toFixed(0)}% used`, w.percent >= 100 ? "error" : "warning");
+      }
+    }
+  };
+  pollChatGpt();
+  setInterval(pollChatGpt, CONFIG.providerCheckIntervalMs);
 
   const cleanupInterval = setInterval(() => {
     if (trackedCosts.size > 10000) trackedCosts.clear();
