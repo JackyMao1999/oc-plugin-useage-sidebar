@@ -229,6 +229,9 @@ interface Strings {
   left: string
   tokens: string
   updated: string
+  inUse: string
+  configured: string
+  notConfigured: string
 }
 
 function makeStrings(lang: Lang): Strings {
@@ -252,6 +255,9 @@ function makeStrings(lang: Lang): Strings {
         left: "剩余",
         tokens: "Token数",
         updated: "更新",
+        inUse: "使用中",
+        configured: "已配置",
+        notConfigured: "未配置",
       }
     : {
         usage: "Usage",
@@ -267,13 +273,40 @@ function makeStrings(lang: Lang): Strings {
         weekly: "Weekly",
         monthly: "Monthly",
         resets: "Resets",
-        used: "used",
+        used: "Used",
         cost: "Cost",
         left: "Left",
         tokens: "Tokens",
         updated: "Updated",
+        inUse: "In use",
+        configured: "Configured",
+        notConfigured: "Not configured",
       }
 }
+
+// ============================================================================
+// 热门提供商元数据（品牌色徽标 + 图标字符，模拟 logo 效果）
+// ============================================================================
+
+interface ProviderMeta {
+  id: string        // provider 的内部 ID（auth.json / 消息里的 providerID）
+  name: string      // 显示名称
+  color: string     // 品牌色（徽标颜色）
+  glyph: string     // 图标字符（终端里代替 logo）
+}
+
+const PROVIDER_META: ProviderMeta[] = [
+  { id: "opencode-go", name: "Go", color: "#3b82f6", glyph: "◆" },
+  { id: "opencode", name: "Zen", color: "#8b5cf6", glyph: "◈" },
+  { id: "openai", name: "ChatGPT", color: "#10a37f", glyph: "●" },
+  { id: "anthropic", name: "Claude", color: "#d97757", glyph: "◉" },
+  { id: "google", name: "Gemini", color: "#4285f4", glyph: "◆" },
+  { id: "codex", name: "Codex", color: "#64748b", glyph: "✦" },
+  { id: "xai", name: "Grok", color: "#e2e8f0", glyph: "✧" },
+  { id: "deepseek", name: "DeepSeek", color: "#4f46e5", glyph: "❖" },
+  { id: "zhipuai", name: "GLM", color: "#2563eb", glyph: "❖" },
+  { id: "siliconflow-cn", name: "SiliconFlow", color: "#0891b2", glyph: "❖" },
+]
 
 
 // ============================================================================
@@ -375,6 +408,76 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
 
   // providers : 所有 Provider 的用量数据
   const providers = createMemo(() => data().providerUsage)
+
+  // readAuthKeys: 从 auth.json 读取哪些 provider 已经登录（有 API key）
+  const readAuthKeys = (): Record<string, boolean> => {
+    try {
+      const authPath = join(homedir(), ".local", "share", "opencode", "auth.json")
+      if (!existsSync(authPath)) return {}
+      const auth = JSON.parse(readFileSync(authPath, "utf-8"))
+      const out: Record<string, boolean> = {}
+      for (const [id, v] of Object.entries(auth)) {
+        out[id] = Boolean((v as any)?.key)
+      }
+      return out
+    } catch {
+      return {}
+    }
+  }
+
+  // activeProviderIds : 当前会话实际在用的 provider
+  //   同时收集两层：
+  //   1. 传输层 —— 最近 assistant 消息的 providerID（如 "opencode-go" → Go 计划）
+  //   2. 模型层 —— session.model.providerID（如 "deepseek" → DeepSeek 模型）
+  const activeProviderIds = createMemo(() => {
+    const ids = new Set<string>()
+    if (!props.api.state?.ready || !props.sessionId) return ids
+    try {
+      const msgs = props.api.state.session.messages(props.sessionId)
+      for (const m of msgs) {
+        if ((m as any).role === "assistant" && (m as any).providerID) {
+          ids.add((m as any).providerID)
+        }
+      }
+      const s = props.api.state.session.get(props.sessionId)
+      if (s?.model?.providerID) ids.add(s.model.providerID)
+    } catch {
+      // 会话尚未加载完时忽略
+    }
+    return ids
+  })
+
+  // knownProviders : 热门提供商列表 + 状态
+  //   active     : 当前会话正在使用的 provider（accent 高亮）
+  //   configured : auth.json 里有没有这个 provider 的 key
+  //   pu         : 数据文件里有该 provider 的用量数据（有则显示明细）
+  const knownProviders = createMemo(() => {
+    const puMap = providers()
+    const keys = readAuthKeys()
+    const activeIds = activeProviderIds()
+    const list: Array<ProviderMeta & { active: boolean; configured: boolean; pu?: ProviderUsage }> =
+      PROVIDER_META.map((m) => ({
+        ...m,
+        active: activeIds.has(m.id),
+        configured: Boolean(keys[m.id]),
+        pu: puMap[m.id],
+      }))
+    // 数据文件里出现但不在热门列表里的 provider，也列出来
+    for (const id of Object.keys(puMap)) {
+      if (!PROVIDER_META.some((m) => m.id === id)) {
+        list.push({
+          id,
+          name: DISPLAY_NAMES[id] || id,
+          color: "#94a3b8",
+          glyph: "●",
+          active: activeIds.has(id),
+          configured: Boolean(keys[id]),
+          pu: puMap[id],
+        })
+      }
+    }
+    return list
+  })
 
   // goUsage : 优先用官方 API 的实时数据，其次用 JSON 文件里缓存的 goApi，都没有才回退 goWindows
   const goUsage = createMemo(() => {
@@ -519,6 +622,40 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
     </box>
   )
 
+  // ProviderDetails: 某个 provider 的用量明细
+  //   Go：官方 API 三窗口进度条；其他：费用/剩余/Token 数
+  const ProviderDetails = (id: string, pu?: ProviderUsage) => (
+    <box paddingLeft={2}>
+      <Show when={id === "opencode-go" && goUsage()}>
+        {GoWindowPercent(t.rolling5h, goUsage()!.rolling)}
+        {GoWindowPercent(t.weekly, goUsage()!.weekly)}
+        {GoWindowPercent(t.monthly, goUsage()!.monthly)}
+      </Show>
+
+      <Show when={id === "opencode-go" && !goUsage() && pu?.goWindows}>
+        {BarRow(t.rolling5h, (pu!.goWindows!.rolling5h.cost / pu!.goWindows!.rolling5h.limit) * 100, pctColor((pu!.goWindows!.rolling5h.cost / pu!.goWindows!.rolling5h.limit) * 100))}
+        {BarRow(t.weekly, (pu!.goWindows!.weekly.cost / pu!.goWindows!.weekly.limit) * 100, pctColor((pu!.goWindows!.weekly.cost / pu!.goWindows!.weekly.limit) * 100))}
+        {BarRow(t.monthly, (pu!.goWindows!.monthly.cost / pu!.goWindows!.monthly.limit) * 100, pctColor((pu!.goWindows!.monthly.cost / pu!.goWindows!.monthly.limit) * 100))}
+      </Show>
+
+      <Show when={id !== "opencode-go" && pu?.cost != null}>
+        {InfoRow(t.cost, `$${pu!.cost!.toFixed(2)}`)}
+      </Show>
+
+      <Show when={id !== "opencode-go" && pu?.limit != null && pu!.limit! > 0 && pu?.cost != null}>
+        {BarRow(t.used, (pu!.cost! / pu!.limit!) * 100, pctColor((pu!.cost! / pu!.limit!) * 100))}
+      </Show>
+
+      <Show when={pu?.remaining != null && id !== "opencode-go"}>
+        {InfoRow(t.left, `$${pu!.remaining!.toFixed(2)}`)}
+      </Show>
+
+      <Show when={pu?.totalTokens != null}>
+        {InfoRow(t.tokens, pu!.totalTokens!.toLocaleString())}
+      </Show>
+    </box>
+  )
+
   // -------- 以下是主渲染结构（JSX，看起来像 HTML） --------
   // 从 <box> 开始一直到 </box>，就是整个侧边栏面板的 UI
 
@@ -558,50 +695,29 @@ return (
             <text fg={theme().text}><b>🌐 {t.providers}</b></text>
           </box>
           <Show when={openProviders()}>
-            <Show when={Object.keys(providers()).length === 0}>
-              <text fg={theme().textMuted} paddingLeft={2}>{t.noneConfigured}</text>
-            </Show>
-
-            <For each={Object.entries(providers())}>
-              {([name, pu]) => (
+            <For each={knownProviders()}>
+              {(p) => (
                 <box paddingLeft={2}>
-                  <text fg={theme().accent}><b>{DISPLAY_NAMES[name] || name}</b></text>
-
-                  <Show when={name === "opencode-go" && goUsage()}>
-                    {GoWindowPercent(t.rolling5h, goUsage()!.rolling)}
-                    {GoWindowPercent(t.weekly, goUsage()!.weekly)}
-                    {GoWindowPercent(t.monthly, goUsage()!.monthly)}
-                  </Show>
-
-                  <Show when={name === "opencode-go" && !goUsage() && pu.goWindows}>
-                    {BarRow(t.rolling5h, (pu.goWindows!.rolling5h.cost / pu.goWindows!.rolling5h.limit) * 100, pctColor((pu.goWindows!.rolling5h.cost / pu.goWindows!.rolling5h.limit) * 100))}
-                    {InfoRow(t.resets, "")}
-                    {BarRow(t.weekly, (pu.goWindows!.weekly.cost / pu.goWindows!.weekly.limit) * 100, pctColor((pu.goWindows!.weekly.cost / pu.goWindows!.weekly.limit) * 100))}
-                    {InfoRow(t.resets, "")}
-                    {BarRow(t.monthly, (pu.goWindows!.monthly.cost / pu.goWindows!.monthly.limit) * 100, pctColor((pu.goWindows!.monthly.cost / pu.goWindows!.monthly.limit) * 100))}
-                    {InfoRow(t.resets, "")}
-                  </Show>
-
-                  <Show when={!pu.goWindows && pu.cost != null}>
-                    {InfoRow(t.cost, `$${pu.cost!.toFixed(2)}`)}
-                  </Show>
-
-                  <Show when={!pu.goWindows && pu.limit != null && pu.limit! > 0 && pu.cost != null}>
-                    {BarRow(t.used, (pu.cost! / pu.limit!) * 100, pctColor((pu.cost! / pu.limit!) * 100))}
-                  </Show>
-
-                  <Show when={pu.remaining != null && !pu.goWindows}>
-                    {InfoRow(t.left, `$${pu.remaining!.toFixed(2)}`)}
-                  </Show>
-
-                  <Show when={pu.totalTokens != null}>
-                    {InfoRow(t.tokens, pu.totalTokens!.toLocaleString())}
+                  {/* 徽标 + 名称 + 状态 */}
+                  <box flexDirection="row" gap={1}>
+                    <text fg={p.color}>{p.glyph}</text>
+                    <text fg={p.active ? theme().accent : theme().text}>
+                      <b>{p.name}</b>
+                    </text>
+                    <box flexGrow={1} />
+                    <text fg={p.active ? theme().accent : p.configured ? theme().success : theme().textMuted}>
+                      {p.active ? t.inUse : p.configured ? t.configured : t.notConfigured}
+                    </text>
+                  </box>
+                  {/* 有数据或 Go 有实时用量时显示明细 */}
+                  <Show when={p.pu || (p.id === "opencode-go" && goUsage())}>
+                    {ProviderDetails(p.id, p.pu)}
                   </Show>
                 </box>
               )}
             </For>
 
-            <Show when={Object.keys(providers()).length > 0 && data().lastUpdated}>
+            <Show when={data().lastUpdated}>
               <text fg={theme().textMuted} paddingLeft={2}>
                 {t.updated}: {new Date(data().lastUpdated).toLocaleTimeString(undefined, { hour12: false })}
               </text>
