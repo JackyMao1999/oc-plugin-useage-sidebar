@@ -477,6 +477,7 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   //   active     : 当前会话正在使用的 provider（accent 高亮）
   //   configured : auth.json 里有没有这个 provider 的 key
   //   pu         : 数据文件里有该 provider 的用量数据（有则显示明细）
+  //   排序：当前正在使用的排在最前面
   const knownProviders = createMemo(() => {
     const puMap = providers()
     const keys = readAuthKeys()
@@ -502,8 +503,13 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
         })
       }
     }
+    // 当前使用的 provider 排最前
+    list.sort((a, b) => (b.active ? 1 : 0) - (a.active ? 1 : 0))
     return list
   })
+
+  // hasActiveProvider : 是否检测到当前使用的提供商（新会话还没回复时可能为空）
+  const hasActiveProvider = createMemo(() => activeProviderIds().size > 0)
 
   // goUsage : 优先用官方 API 的实时数据，其次用 JSON 文件里缓存的 goApi，都没有才回退 goWindows
   const goUsage = createMemo(() => {
@@ -757,8 +763,9 @@ return (
                       {p.active ? t.inUse : p.configured ? t.configured : t.notConfigured}
                     </text>
                   </box>
-                  {/* 有数据或 Go 有实时用量时显示明细 */}
-                  <Show when={p.pu || (p.id === "opencode-go" && goUsage())}>
+                  {/* 只有当前使用的提供商显示明细；
+                新会话还没回复（检测不到活跃提供商）时回退为全部显示 */}
+                  <Show when={(p.active || !hasActiveProvider()) && (p.pu || (p.id === "opencode-go" && goUsage()))}>
                     {ProviderDetails(p.id, p.pu)}
                   </Show>
                 </box>
