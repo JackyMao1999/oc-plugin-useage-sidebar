@@ -1,5 +1,7 @@
 # oc-plugin-usage
 
+**English** | [中文](./README.zh-CN.md)
+
 AI model usage monitoring plugin for [opencode](https://opencode.ai). Tracks session, tool, and file activity, with optional API provider quota monitoring.
 
 ## Features
