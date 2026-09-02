@@ -12,6 +12,37 @@ const CONFIG = {
   dataFileName: "oc-plugin-usage-data.json",
 };
 
+// 阈值配置文件：TUI 插件手动调整阈值时写入，Server 每轮询读取，两边保持一致
+const CONFIG_FILE = join(homedir(), ".opencode", "oc-plugin-usage-config.json");
+
+// 读取阈值：文件（用户手动调整） > 插件选项 > 默认 80
+function readThresholdFile(): number {
+  try {
+    if (existsSync(CONFIG_FILE)) {
+      const n = Number(JSON.parse(readFileSync(CONFIG_FILE, "utf-8"))?.usageThresholdPercent);
+      if (Number.isFinite(n) && n > 0 && n <= 100) return n;
+    }
+  } catch {
+    // 文件损坏时用默认值
+  }
+  return CONFIG.thresholdPercent;
+}
+
+// 已提醒过的百分比：只在"跨越阈值"时提醒一次，避免每轮轮询都弹
+//   1. 首次达到阈值 → 提醒
+//   2. 比上次提醒高了 ≥10 个百分点 → 提醒（80→90→100 逐步升级）
+//   3. 上次提醒时还没到阈值（阈值被调低了）→ 提醒
+const notifiedPct = new Map<string, number>();
+function crossedThreshold(key: string, pct: number, threshold: number): boolean {
+  const last = notifiedPct.get(key);
+  if (pct < threshold) return false;
+  if (last === undefined || last < threshold || pct >= last + 10) {
+    notifiedPct.set(key, pct);
+    return true;
+  }
+  return false;
+}
+
 function todayKey(): string {
   return new Date().toISOString().slice(0, 10);
 }
@@ -491,7 +522,6 @@ async function tryShowToast(ctx: any, message: string, variant: "info" | "succes
 
 const UsagePlugin: Plugin = async (ctx, rawOptions) => {
   const opts = (rawOptions || {}) as PluginOptions;
-  const thresholdPct = opts.usageThresholdPercent ?? CONFIG.thresholdPercent;
   const dataFile = join(homedir(), ".opencode", CONFIG.dataFileName);
   const data = loadData(dataFile);
   let unsaved = false;
@@ -528,7 +558,7 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
       markDirty();
       if (pu.limit != null && pu.cost != null && pu.limit > 0) {
         const pct = (pu.cost / pu.limit) * 100;
-        if (pct >= thresholdPct) {
+        if (crossedThreshold("openai.cost", pct, readThresholdFile())) {
           await notifyThreshold(ctx as any, "OpenAI", pct, pu.cost, pu.limit);
         }
       }
@@ -545,7 +575,7 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
       markDirty();
       if (pu.limit != null && pu.cost != null && pu.limit > 0) {
         const pct = (pu.cost / pu.limit) * 100;
-        if (pct >= thresholdPct) {
+        if (crossedThreshold("anthropic.cost", pct, readThresholdFile())) {
           await notifyThreshold(ctx as any, "Anthropic", pct, pu.cost, pu.limit);
         }
       }
@@ -575,7 +605,7 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
       data.providerUsage["opencode-go"] = go;
       markDirty();
       for (const [name, w] of Object.entries({ "Rolling 5h": goApi.rolling, Weekly: goApi.weekly, Monthly: goApi.monthly })) {
-        if (w.percent >= thresholdPct) {
+        if (crossedThreshold(`go.${name}`, w.percent, readThresholdFile())) {
           await tryShowToast(ctx, `Go ${name}: ${w.percent.toFixed(0)}% used`, w.percent >= 100 ? "error" : "warning");
         }
       }
@@ -593,7 +623,7 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
     data.providerUsage["openai"] = pu;
     markDirty();
     for (const [name, w] of Object.entries({ "5h": usage.primary, Weekly: usage.secondary })) {
-      if (w.percent >= thresholdPct) {
+      if (crossedThreshold(`chatgpt.${name}`, w.percent, readThresholdFile())) {
         await tryShowToast(ctx, `ChatGPT ${name}: ${w.percent.toFixed(0)}% used`, w.percent >= 100 ? "error" : "warning");
       }
     }
@@ -680,14 +710,14 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
               for (const [name, w] of Object.entries({ "Rolling 5h": gw.rolling5h, Weekly: gw.weekly, Monthly: gw.monthly })) {
                 if (w.limit > 0) {
                   const pct = (w.cost / w.limit) * 100;
-                  if (pct >= thresholdPct) {
+                  if (crossedThreshold(`go.${name}`, pct, readThresholdFile())) {
                     await notifyThreshold(ctx as any, `${DISPLAY_NAMES[pid] || pid} ${name}`, pct, w.cost, w.limit);
                   }
                 }
               }
             } else if (data.providerUsage[pid].limit != null && data.providerUsage[pid].limit > 0) {
               const pct = ((data.providerUsage[pid].cost || 0) / data.providerUsage[pid].limit) * 100;
-              if (pct >= thresholdPct) {
+              if (crossedThreshold(`cost.${pid}`, pct, readThresholdFile())) {
                 await notifyThreshold(ctx as any, DISPLAY_NAMES[pid] || pid, pct, data.providerUsage[pid].cost || 0, data.providerUsage[pid].limit);
               }
             }

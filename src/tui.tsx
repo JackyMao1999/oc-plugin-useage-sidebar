@@ -50,12 +50,13 @@ import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
 // Show         : 条件渲染（类似 React 的 {条件 && <div>}）
 //                <Show when={条件}><div>...</div></Show>
 // onCleanup    : 注册一个函数，在组件销毁时执行（清理定时器、取消订阅等）
-import { createSignal, createMemo, For, Show, onCleanup } from "solid-js"
+import { createSignal, createMemo, createEffect, For, Show, onCleanup } from "solid-js"
 
 // -------- 导入 Node.js 内置模块 --------
 // readFileSync : 同步读取文件内容（返回字符串或 Buffer）
 // existsSync   : 检查文件是否存在（返回 true/false）
-import { readFileSync, existsSync } from "fs"
+// writeFileSync : 同步写入文件
+import { readFileSync, writeFileSync, existsSync } from "fs"
 
 // join         : 拼接文件路径（跨平台兼容）
 //               例：join("/home/user", ".opencode", "data.json") → "/home/user/.opencode/data.json"
@@ -74,6 +75,73 @@ import { homedir } from "os"
 // 例：/home/ubuntu/.opencode/oc-plugin-usage-data.json
 // Server 插件（index.ts）把用量数据写入这个文件，TUI 插件从这里读取
 const DATA_FILE = join(homedir(), ".opencode", "oc-plugin-usage-data.json")
+
+// 阈值配置文件 + 调整快捷键
+const CONFIG_FILE = join(homedir(), ".opencode", "oc-plugin-usage-config.json")
+const THRESHOLD_KEY = "ctrl+shift+u"
+
+// 读取用量提醒阈值（%）：文件（手动调整） > 默认 80
+function readThresholdFile(): number {
+  try {
+    if (existsSync(CONFIG_FILE)) {
+      const n = Number(JSON.parse(readFileSync(CONFIG_FILE, "utf-8"))?.usageThresholdPercent)
+      if (Number.isFinite(n) && n > 0 && n <= 100) return n
+    }
+  } catch {
+    // 文件损坏时用默认值
+  }
+  return 80
+}
+
+// 写入用量提醒阈值（%）
+function writeThresholdFile(percent: number) {
+  try {
+    writeFileSync(CONFIG_FILE, JSON.stringify({ usageThresholdPercent: percent }, null, 2))
+  } catch {
+    // 写入失败时静默忽略（下次调整时重试）
+  }
+}
+
+// fmtPct: 百分比格式化 —— 整数不带小数点（API 返回整数时避免假的 ".0"），
+// 有小数时保留 1 位（如 12% / 12.3%）
+function fmtPct(n: number): string {
+  return Number.isInteger(n) ? String(n) : n.toFixed(1)
+}
+
+// 已提醒过的百分比（跨组件共享，状态栏组件负责检查）
+//   只在"跨越阈值"时提醒一次，避免每轮刷新都弹：
+//   1. 首次达到阈值 → 提醒
+//   2. 比上次提醒高了 ≥10 个百分点 → 提醒（80→90→100 逐步升级）
+//   3. 上次提醒时还没到阈值（阈值被调低了）→ 提醒
+const lastNotified = new Map<string, number>()
+function crossedThreshold(key: string, pct: number, threshold: number): boolean {
+  const last = lastNotified.get(key)
+  if (pct < threshold) return false
+  if (last === undefined || last < threshold || pct >= last + 10) {
+    lastNotified.set(key, pct)
+    return true
+  }
+  return false
+}
+
+// 当前会话正在使用的提供商（只会有一个）
+//   /models 选中的模型记录在最近一条 user message 的 info.model.providerID；
+//   assistant 的 providerID 是实际传输层 provider，不能作为模型归属
+function getActiveProviderId(api: any, sessionId?: string): string | undefined {
+  if (!api?.state?.ready || !sessionId) return undefined
+  try {
+    const msgs = api.state.session.messages(sessionId)
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const info = msgs[i]?.info ?? msgs[i]
+      if (info.role === "user" && info.model?.providerID) {
+        return info.model.providerID
+      }
+    }
+  } catch {
+    // 会话尚未加载完时忽略
+  }
+  return undefined
+}
 
 
 // ============================================================================
@@ -248,6 +316,14 @@ interface Strings {
   noActiveProvider: string
   plan: string
   balance: string
+  threshold: string
+  adjustThreshold: string
+  setThresholdTitle: string
+  setThresholdDesc: (current: number) => string
+  invalidThreshold: string
+  thresholdSet: (n: number) => string
+  alertTitle: string
+  alertMessage: (name: string, pct: number, threshold: number) => string
 }
 
 function makeStrings(lang: Lang): Strings {
@@ -277,6 +353,15 @@ function makeStrings(lang: Lang): Strings {
         noActiveProvider: "未检测到使用中的提供商",
         plan: "计划",
         balance: "余额",
+        threshold: "提醒阈值",
+        adjustThreshold: "调整阈值",
+        setThresholdTitle: "设置用量提醒阈值 (%)",
+        setThresholdDesc: (current: number) => `当前阈值 ${current}%。达到或超过该百分比时提醒（系统通知 + 声音）。`,
+        invalidThreshold: "请输入 1~100 之间的数字",
+        thresholdSet: (n: number) => `用量提醒阈值已设为 ${n}%`,
+        alertTitle: "AI 用量提醒",
+        alertMessage: (name: string, pct: number, threshold: number) =>
+          `${name}：已用 ${pct.toFixed(0)}%（提醒阈值 ${threshold}%）`,
       }
     : {
         usage: "Usage",
@@ -303,6 +388,15 @@ function makeStrings(lang: Lang): Strings {
         noActiveProvider: "No provider in use",
         plan: "Plan",
         balance: "Balance",
+        threshold: "Alert threshold",
+        adjustThreshold: "Adjust threshold",
+        setThresholdTitle: "Set usage alert threshold (%)",
+        setThresholdDesc: (current: number) => `Current threshold: ${current}%. Notify (system notification + sound) when usage reaches or exceeds it.`,
+        invalidThreshold: "Enter a number between 1 and 100",
+        thresholdSet: (n: number) => `Alert threshold set to ${n}%`,
+        alertTitle: "AI usage alert",
+        alertMessage: (name: string, pct: number, threshold: number) =>
+          `${name}: ${pct.toFixed(0)}% used (threshold ${threshold}%)`,
       }
 }
 
@@ -375,6 +469,12 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   // goUpdated：最近一次成功拉取官方 API 的时间戳（用于"更新"显示）
   const [goUpdated, setGoUpdated] = createSignal<number | null>(null)
 
+  // threshold：用量提醒阈值（%），从配置文件读取；每 30 秒随数据一起刷新
+  const [threshold, setThreshold] = createSignal(readThresholdFile())
+
+  // thresholdKeyHint：调整阈值的快捷键提示
+  const thresholdKeyHint = "Ctrl+Shift+U"
+
   // 直接调用官方 API（和 opencode.ai 工作台 /go 页面相同的数据源）
   // 无需 workspace ID 或浏览器 cookie，用 auth.json 里的 Go API key 即可
   async function refreshGoApi() {
@@ -421,7 +521,10 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   // setInterval: 每隔 30000 毫秒（30 秒）执行一次
   //   执行时调用 loadData() 重新读取文件，然后用 setData() 更新状态
   //   setData() 更新后，所有依赖 data() 的 UI 都会自动刷新
-  const timer = setInterval(() => setData(loadData()), 30000)
+  const timer = setInterval(() => {
+    setData(loadData())
+    setThreshold(readThresholdFile())
+  }, 30000)
 
   // onCleanup: 当组件被销毁时（比如切换到其他页面），清除定时器
   //   这很重要！如果不清理，定时器会永远运行，造成内存泄漏
@@ -455,23 +558,8 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   }
 
   // activeProviderId : 当前会话正在使用的提供商（只会有一个）
-  //   /models 选中的模型记录在最近一条 user message 的 info.model.providerID；
-  //   assistant 的 providerID 是实际传输层 provider，不能作为模型归属
-  const activeProviderId = createMemo(() => {
-    if (!props.api.state?.ready || !props.sessionId) return undefined
-    try {
-      const msgs = props.api.state.session.messages(props.sessionId)
-      for (let i = msgs.length - 1; i >= 0; i--) {
-        const info = (msgs[i] as any).info ?? (msgs[i] as any)
-        if (info.role === "user" && info.model?.providerID) {
-          return info.model.providerID
-        }
-      }
-    } catch {
-      // 会话尚未加载完时忽略
-    }
-    return undefined
-  })
+  //   用 /models 里当前模型所属的提供商；会话模型还没建立时回退到最近消息
+  const activeProviderId = createMemo(() => getActiveProviderId(props.api, props.sessionId))
 
   // knownProviders : 提供商列表 —— 只包含当前正在使用的那个提供商
   //   用哪个模型就显示哪个提供商（切换模型后自动变化）
@@ -574,11 +662,7 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
     return s + " ".repeat(pad)
   }
 
-  // fmtPct: 百分比格式化 —— 整数不带小数点（API 返回整数时避免假的 ".0"），
-//   有小数时保留 1 位（如 12% / 12.3%）
-const fmtPct = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(1))
-
-// BarRow: 一行"标签 + 色块进度条 + 百分比"
+  // BarRow: 一行"标签 + 色块进度条 + 百分比"
   //   例：最近5小时  ██████░░ 66%
   const BarRow = (labelText: string, pct: number, color: string) => {
     const barLen = 8
@@ -757,6 +841,13 @@ return (
               )}
             </For>
 
+            {/* 提醒阈值：Ctrl+Alt+U 或命令面板调整 */}
+            <box flexDirection="row" gap={1} paddingLeft={2}>
+              <text fg={theme().textMuted}>{t.threshold}:</text>
+              <text fg={theme().accent}><b>{threshold()}%</b></text>
+              <text fg={theme().textMuted}>({t.adjustThreshold}: {thresholdKeyHint})</text>
+            </box>
+
             {/* Go 数据在显示时，用真正的 API 拉取时间；否则用数据文件的保存时间 */}
             <Show when={goUsage() && goUpdated()}>
               <text fg={theme().textMuted} paddingLeft={2}>
@@ -771,6 +862,121 @@ return (
           </Show>
         </box>
       </Show>
+    </box>
+  )
+}
+
+
+// ============================================================================
+// 系统通知 + 常驻状态栏
+// ============================================================================
+
+// checkAllAlerts : 检查所有提供商是否跨越了提醒阈值
+//   跨越时用 api.attention.notify 发系统通知（+ 声音）
+//   由下面的 UsageStatusBar 每 30 秒调用一次
+async function checkAllAlerts(api: any, data: UsageData, t: Strings, threshold: number) {
+  if (!api?.attention?.notify) return
+  const alerts: Array<{ name: string; pct: number }> = []
+  const puMap = data.providerUsage || {}
+  for (const [pid, pu] of Object.entries(puMap)) {
+    const name = DISPLAY_NAMES[pid] || pid
+    if (pid === "opencode-go" && pu.goApi) {
+      for (const [wname, w] of Object.entries({ [t.rolling5h]: pu.goApi.rolling, [t.weekly]: pu.goApi.weekly, [t.monthly]: pu.goApi.monthly })) {
+        if (crossedThreshold(`go.${wname}`, w.percent, threshold)) {
+          alerts.push({ name: `${name} ${wname}`, pct: w.percent })
+        }
+      }
+    } else if (pid === "openai" && pu.chatgpt) {
+      for (const [wname, w] of Object.entries({ [t.rolling5h]: pu.chatgpt.primary, [t.weekly]: pu.chatgpt.secondary })) {
+        if (crossedThreshold(`chatgpt.${wname}`, w.percent, threshold)) {
+          alerts.push({ name: `${name} ${wname}`, pct: w.percent })
+        }
+      }
+    }
+    if (pu.cost != null && pu.limit != null && pu.limit > 0) {
+      const pct = (pu.cost / pu.limit) * 100
+      if (crossedThreshold(`cost.${pid}`, pct, threshold)) {
+        alerts.push({ name, pct })
+      }
+    }
+  }
+  for (const a of alerts) {
+    try {
+      await api.attention.notify({
+        title: `${t.alertTitle}: ${a.name}`,
+        message: t.alertMessage(a.name, a.pct, threshold),
+        notification: true,
+        sound: { name: a.pct >= 100 ? "error" : "default" },
+      })
+    } catch {
+      // 通知不可用时静默失败（如未开 attention）
+    }
+  }
+}
+
+// UsageStatusBar: 侧边栏底部常驻状态栏 —— 常驻显示当前提供商的用量 + 阈值
+//   - 注册在 sidebar_footer 槽位（single_winner，order 50 赢得内置插件）
+//   - 固定在侧边栏底部，不随内容滚动；每 30 秒重新读取数据文件，
+//     同时检查所有提供商是否跨越阈值 → 系统通知（api.attention.notify）
+//   - 右侧保留内置 footer 原本的 目录: 分支 信息
+function UsageStatusBar(props: { api: any; sessionId?: string; lang: Lang }) {
+  const t = makeStrings(props.lang ?? "en")
+  const [data, setData] = createSignal(loadData())
+  const [threshold, setThreshold] = createSignal(readThresholdFile())
+  const theme = () => props.api.theme.current
+
+  const timer = setInterval(() => {
+    setData(loadData())
+    setThreshold(readThresholdFile())
+  }, 30000)
+  onCleanup(() => clearInterval(timer))
+
+  const activeId = createMemo(() => getActiveProviderId(props.api, props.sessionId))
+
+  // 当前提供商的所有用量窗口（用于状态栏显示最大百分比）
+  const windows = createMemo(() => {
+    const id = activeId()
+    if (!id) return []
+    const pu = data().providerUsage?.[id]
+    const out: Array<{ name: string; pct: number }> = []
+    if (id === "opencode-go" && pu?.goApi) {
+      out.push({ name: t.rolling5h, pct: pu.goApi.rolling.percent })
+      out.push({ name: t.weekly, pct: pu.goApi.weekly.percent })
+      out.push({ name: t.monthly, pct: pu.goApi.monthly.percent })
+    } else if (id === "openai" && pu?.chatgpt) {
+      out.push({ name: t.rolling5h, pct: pu.chatgpt.primary.percent })
+      out.push({ name: t.weekly, pct: pu.chatgpt.secondary.percent })
+    } else if (pu?.cost != null && pu?.limit != null && pu.limit > 0) {
+      out.push({ name: t.used, pct: (pu.cost / pu.limit) * 100 })
+    }
+    return out
+  })
+
+  // 每次数据刷新时检查所有提供商是否跨越阈值 → 系统通知
+  createEffect(() => {
+    checkAllAlerts(props.api, data(), t, threshold())
+  })
+
+  const id = activeId()
+  if (id === undefined || windows().length === 0) return null
+
+  const meta = PROVIDER_META.find((m) => m.id === id)
+  const maxPct = Math.max(...windows().map((w) => w.pct))
+  const over = maxPct >= threshold()
+  const barColor = over ? (maxPct >= 100 ? theme().error : theme().warning) : theme().textMuted
+
+  // 内置 footer 原本显示的 目录（分支在应用最底部栏已显示，这里只补目录名）
+  const dir = props.api.state?.path?.directory
+  const base = dir ? String(dir).split(/[\\/]/).pop() : undefined
+
+  return (
+    <box flexDirection="row" gap={1}>
+      <text fg={meta?.color ?? "#94a3b8"}>{meta?.glyph ?? "●"}</text>
+      <text fg={theme().text}><b>{meta?.name ?? id}</b></text>
+      <text fg={barColor}>{fmtPct(maxPct)}%</text>
+      <text fg={theme().textMuted}>·{threshold()}%</text>
+      <box flexGrow={1} />
+      <text fg={theme().textMuted}>{base}</text>
     </box>
   )
 }
@@ -799,6 +1005,74 @@ const tui: TuiPlugin = async (api, options) => {
   // 支持 "zh"（中文）或 "en"（英文，默认）
   const opts = (options || {}) as { language?: string }
   const lang: Lang = opts.language === "zh" ? "zh" : "en"
+  const t = makeStrings(lang)
+
+  // 调整提醒阈值的对话框（Ctrl+Alt+U 或命令面板触发）
+  const DialogPrompt = api.ui.DialogPrompt
+  function openThresholdDialog() {
+    const current = readThresholdFile()
+    api.ui.dialog.replace(
+      () => (
+        <DialogPrompt
+          title={t.setThresholdTitle}
+          description={() => (
+            <text fg={api.theme.current.textMuted}>{t.setThresholdDesc(current)}</text>
+          )}
+          placeholder="10-100"
+          value={String(current)}
+          onConfirm={(v) => {
+            const n = Math.round(Number(v))
+            if (Number.isFinite(n) && n >= 1 && n <= 100) {
+              writeThresholdFile(n)
+              api.ui.toast({ variant: "success", message: t.thresholdSet(n) })
+            } else {
+              api.ui.toast({ variant: "error", message: t.invalidThreshold })
+            }
+            api.ui.dialog.clear()
+          }}
+          onCancel={() => api.ui.dialog.clear()}
+        />
+      ),
+      () => {},
+    )
+  }
+
+  // 调整提醒阈值的命令（命令面板 Ctrl+P 可搜到；回车触发）
+  // 用 v1 兼容的 api.command.register —— 保证命令出现在命令面板
+  api.command?.register(() => [
+    {
+      title: lang === "zh" ? "设置用量提醒阈值" : "Set usage alert threshold",
+      value: "oc-plugin-usage.set-threshold",
+      description: lang === "zh" ? `当前 ${readThresholdFile()}%` : `Current ${readThresholdFile()}%`,
+      category: "Usage",
+      onSelect: () => openThresholdDialog(),
+    },
+  ])
+
+  // 快捷键层：Ctrl+Shift+U 触发同一个对话框（终端不支持组合键时可用命令面板）
+  // 注意：keymap 的修饰键只有 ctrl/shift/meta/super/hyper，没有 alt
+  try {
+    api.keymap.registerLayer({
+      commands: [
+        {
+          name: "oc-plugin-usage.set-threshold",
+          title: lang === "zh" ? "设置用量提醒阈值" : "Set usage alert threshold",
+          category: "Usage",
+          run: () => openThresholdDialog(),
+        },
+      ],
+    })
+  } catch {
+    // 命令层注册失败不影响命令面板入口
+  }
+  try {
+    api.keymap.registerLayer({
+      bindings: [{ key: "ctrl+shift+u", cmd: "oc-plugin-usage.set-threshold" }],
+    })
+  } catch {
+    // 绑定键解析失败（终端不支持）时忽略
+  }
+
   // api.slots.register() : 注册一个"插槽插件"
   // 插槽 = opencode 界面上的特定位置（比如侧边栏、Logo 区域等）
   // 你可以在这些位置插入自定义的 UI 内容
@@ -829,6 +1103,17 @@ const tui: TuiPlugin = async (api, options) => {
 sidebar_content(_ctx, props) {
         // props.session_id : 当前正在查看的会话 ID（用于计算该会话的缓存命中率）
         return <UsageSidebar api={api} sessionId={props.session_id} lang={lang} />
+      },
+    },
+  })
+
+  // sidebar_footer 是 single_winner 槽位：内置插件以 order 100 注册，
+  // 我们以 order 50 注册才能赢得它（否则显示不了常驻状态栏）
+  api.slots.register({
+    order: 50,
+    slots: {
+      sidebar_footer(_ctx, props) {
+        return <UsageStatusBar api={api} sessionId={props.session_id} lang={lang} />
       },
     },
   })
