@@ -432,32 +432,6 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
     return theme().success
   }
 
-  // ProgressBar: 进度条组件
-  //   用 "█" 和 "░" 字符画出 8 格长的进度条
-  //   例：pct = 42 → filled = 3 → "███░░░░░ 42%"
-  const ProgressBar = (pct: number) => {
-    const barLen = 8                                                    // 进度条长度（8 格）
-    const filled = Math.round((pct / 100) * barLen)                    // 已填充的格数
-    const color = pctColor(pct)
-    return (
-      // <box> : 一个容器（类似 HTML 的 <div>）
-      //   flexDirection="row" : 子元素水平排列
-      //   gap={1}             : 子元素之间间隔 1 个单位
-      //   paddingLeft={2}     : 左边内边距 2 个单位（实现缩进效果）
-      <box flexDirection="row" gap={1} paddingLeft={2}>
-        {/* <text> : 显示一段文字
-            fg={color} : 文字颜色（foreground） */}
-        <text fg={color}>
-          {/* "█".repeat(3) → "███"
-              "░".repeat(5) → "░░░░░"
-              两者拼接 → "███░░░░░" */}
-          {"█".repeat(filled)}{"░".repeat(Math.max(0, barLen - filled))}
-        </text>
-        <text fg={color}>{pct.toFixed(1)}%</text>
-      </box>
-    )
-  }
-
   // cacheColor: 缓存命中率的颜色
   //   60% 以上 → success（绿色，说明大部分输入走了缓存，省钱）
   //   30~60%  → warning（黄色）
@@ -467,6 +441,49 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
     if (hit >= 30) return theme().warning
     return theme().error
   }
+
+  // displayWidth: 计算字符串在终端里的显示宽度（中文等宽字符按 2 格算）
+  const displayWidth = (s: string) => {
+    let w = 0
+    for (const ch of s) w += ch.charCodeAt(0) > 255 ? 2 : 1
+    return w
+  }
+
+  // padLabel: 把标签补空格到固定宽度，让"标签 + 数值"整齐对齐
+  //   例：padLabel("命中率") → "命中率   "（补到 10 格）
+  const padLabel = (s: string, width = 10) => {
+    const pad = Math.max(0, width - displayWidth(s))
+    return s + " ".repeat(pad)
+  }
+
+  // BarRow: 一行"标签 + 色块进度条 + 百分比"
+  //   例：最近5小时  ██████░░ 66.0%
+  const BarRow = (labelText: string, pct: number, color: string) => {
+    const barLen = 8
+    const filled = Math.round((pct / 100) * barLen)
+    return (
+      <box flexDirection="row" gap={1}>
+        <text fg={theme().textMuted}>{padLabel(labelText)}</text>
+        <text fg={color}>
+          {"█".repeat(filled)}{"░".repeat(Math.max(0, barLen - filled))}
+        </text>
+        <text fg={color}>{pct.toFixed(1)}%</text>
+      </box>
+    )
+  }
+
+  // InfoRow: 一行"标签 + 数值"（数值用强调色显示）
+  const InfoRow = (labelText: string, value: string) => (
+    <box flexDirection="row" gap={1}>
+      <text fg={theme().textMuted}>{padLabel(labelText)}</text>
+      <text fg={theme().text}>{value}</text>
+    </box>
+  )
+
+  // divider: 区域之间的分隔线
+  const divider = () => (
+    <text fg={theme().borderSubtle}>{"─".repeat(24)}</text>
+  )
 
   // fmtTokens: 把 token 数格式化成易读形式
   //   例：fmtTokens(123456) → "123.5k"
@@ -488,17 +505,16 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   }
 
   // GoWindowPercent: 一个官方 API 时间窗口的渲染
-  //   显示 "已用 X%" 进度条 + 重置倒计时
-  const GoWindowPercent = (label: string, w: GoApiWindow) => (
+  //   第一行：标签 + 色块进度条 + 已用百分比
+  //   第二行：对齐的"重置"倒计时
+  const GoWindowPercent = (labelText: string, w: GoApiWindow) => (
     <box>
-      <text fg={theme().textMuted}>
-        {label}: {w.percent.toFixed(1)}% {t.used}
-      </text>
-      {ProgressBar(w.percent)}
+      {BarRow(labelText, w.percent, pctColor(w.percent))}
       <Show when={w.resetsAt}>
-        <text fg={theme().textMuted}>
-          {t.resets}: {resetIn(w.resetsAt!)}
-        </text>
+        <box flexDirection="row" gap={1}>
+          <text fg={theme().textMuted}>{padLabel(t.resets)}</text>
+          <text fg={theme().accent}>{resetIn(w.resetsAt!)}</text>
+        </box>
       </Show>
     </box>
   )
@@ -510,30 +526,22 @@ return (
     <box>
       <box flexDirection="row" gap={1} onMouseDown={() => setOpen((x) => !x)}>
         {label(open())}
-        <text fg={theme().text}><b>{t.usage}</b></text>
+        <text fg={theme().text}><b>⚡ {t.usage}</b></text>
       </box>
       <Show when={open()}>
         <box paddingLeft={1}>
 
           <box flexDirection="row" gap={1} onMouseDown={() => setOpenCache((x) => !x)}>
             {label(openCache())}
-            <text fg={theme().text}><b>{t.sessionCache}</b></text>
+            <text fg={theme().text}><b>💾 {t.sessionCache}</b></text>
           </box>
 
           <Show when={openCache() && cacheStats().turns > 0}>
             <box paddingLeft={2}>
-              <text fg={cacheColor(cacheStats().hit)}>
-                {t.hitRate}: {cacheStats().hit.toFixed(1)}%
-              </text>
-              <text fg={theme().textMuted}>
-                {t.input}:    {fmtTokens(cacheStats().input)}
-              </text>
-              <text fg={theme().textMuted}>
-                {t.read}:     {fmtTokens(cacheStats().read)}
-              </text>
-              <text fg={theme().textMuted}>
-                {t.write}:    {fmtTokens(cacheStats().write)}
-              </text>
+              {BarRow(t.hitRate, cacheStats().hit, cacheColor(cacheStats().hit))}
+              {InfoRow(t.input, fmtTokens(cacheStats().input))}
+              {InfoRow(t.read, fmtTokens(cacheStats().read))}
+              {InfoRow(t.write, fmtTokens(cacheStats().write))}
             </box>
           </Show>
 
@@ -543,9 +551,11 @@ return (
             </text>
           </Show>
 
+          {divider()}
+
           <box flexDirection="row" gap={1} onMouseDown={() => setOpenProviders((x) => !x)}>
             {label(openProviders())}
-            <text fg={theme().text}><b>{t.providers}</b></text>
+            <text fg={theme().text}><b>🌐 {t.providers}</b></text>
           </box>
           <Show when={openProviders()}>
             <Show when={Object.keys(providers()).length === 0}>
@@ -555,7 +565,7 @@ return (
             <For each={Object.entries(providers())}>
               {([name, pu]) => (
                 <box paddingLeft={2}>
-                  <text fg={theme().accent}>{DISPLAY_NAMES[name] || name}</text>
+                  <text fg={theme().accent}><b>{DISPLAY_NAMES[name] || name}</b></text>
 
                   <Show when={name === "opencode-go" && goUsage()}>
                     {GoWindowPercent(t.rolling5h, goUsage()!.rolling)}
@@ -564,34 +574,28 @@ return (
                   </Show>
 
                   <Show when={name === "opencode-go" && !goUsage() && pu.goWindows}>
-                    <text fg={theme().textMuted}>
-                      {t.rolling5h}: ${pu.goWindows!.rolling5h.cost.toFixed(2)} / ${pu.goWindows!.rolling5h.limit}
-                    </text>
-                    {ProgressBar((pu.goWindows!.rolling5h.cost / pu.goWindows!.rolling5h.limit) * 100)}
-                    <text fg={theme().textMuted}>
-                      {t.weekly}:     ${pu.goWindows!.weekly.cost.toFixed(2)} / ${pu.goWindows!.weekly.limit}
-                    </text>
-                    {ProgressBar((pu.goWindows!.weekly.cost / pu.goWindows!.weekly.limit) * 100)}
-                    <text fg={theme().textMuted}>
-                      {t.monthly}:    ${pu.goWindows!.monthly.cost.toFixed(2)} / ${pu.goWindows!.monthly.limit}
-                    </text>
-                    {ProgressBar((pu.goWindows!.monthly.cost / pu.goWindows!.monthly.limit) * 100)}
+                    {BarRow(t.rolling5h, (pu.goWindows!.rolling5h.cost / pu.goWindows!.rolling5h.limit) * 100, pctColor((pu.goWindows!.rolling5h.cost / pu.goWindows!.rolling5h.limit) * 100))}
+                    {InfoRow(t.resets, "")}
+                    {BarRow(t.weekly, (pu.goWindows!.weekly.cost / pu.goWindows!.weekly.limit) * 100, pctColor((pu.goWindows!.weekly.cost / pu.goWindows!.weekly.limit) * 100))}
+                    {InfoRow(t.resets, "")}
+                    {BarRow(t.monthly, (pu.goWindows!.monthly.cost / pu.goWindows!.monthly.limit) * 100, pctColor((pu.goWindows!.monthly.cost / pu.goWindows!.monthly.limit) * 100))}
+                    {InfoRow(t.resets, "")}
                   </Show>
 
                   <Show when={!pu.goWindows && pu.cost != null}>
-                    <text fg={theme().textMuted}>{t.cost}: ${pu.cost!.toFixed(2)}</text>
+                    {InfoRow(t.cost, `$${pu.cost!.toFixed(2)}`)}
                   </Show>
 
                   <Show when={!pu.goWindows && pu.limit != null && pu.limit! > 0 && pu.cost != null}>
-                    {ProgressBar((pu.cost! / pu.limit!) * 100)}
+                    {BarRow(t.used, (pu.cost! / pu.limit!) * 100, pctColor((pu.cost! / pu.limit!) * 100))}
                   </Show>
 
                   <Show when={pu.remaining != null && !pu.goWindows}>
-                    <text fg={theme().textMuted}>{t.left}: ${pu.remaining!.toFixed(2)}</text>
+                    {InfoRow(t.left, `$${pu.remaining!.toFixed(2)}`)}
                   </Show>
 
                   <Show when={pu.totalTokens != null}>
-                    <text fg={theme().textMuted}>{t.tokens}: {pu.totalTokens!.toLocaleString()}</text>
+                    {InfoRow(t.tokens, pu.totalTokens!.toLocaleString())}
                   </Show>
                 </box>
               )}
@@ -599,7 +603,7 @@ return (
 
             <Show when={Object.keys(providers()).length > 0 && data().lastUpdated}>
               <text fg={theme().textMuted} paddingLeft={2}>
-                {t.updated}: {new Date(data().lastUpdated).toLocaleTimeString()}
+                {t.updated}: {new Date(data().lastUpdated).toLocaleTimeString(undefined, { hour12: false })}
               </text>
             </Show>
           </Show>
