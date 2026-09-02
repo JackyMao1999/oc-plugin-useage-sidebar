@@ -455,17 +455,17 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   }
 
   // activeProviderId : 当前会话正在使用的提供商（只会有一个）
-  //   优先用 session.model.providerID —— 即 /models 里当前模型所属的提供商；
-  //   会话模型还没建立时，回退到最近一条 assistant 消息的 providerID
+  //   /models 选中的模型记录在最近一条 user message 的 info.model.providerID；
+  //   assistant 的 providerID 是实际传输层 provider，不能作为模型归属
   const activeProviderId = createMemo(() => {
     if (!props.api.state?.ready || !props.sessionId) return undefined
     try {
-      const s = props.api.state.session.get(props.sessionId)
-      if (s?.model?.providerID) return s.model.providerID
       const msgs = props.api.state.session.messages(props.sessionId)
       for (let i = msgs.length - 1; i >= 0; i--) {
-        const m = msgs[i] as any
-        if (m.role === "assistant" && m.providerID) return m.providerID
+        const info = (msgs[i] as any).info ?? (msgs[i] as any)
+        if (info.role === "user" && info.model?.providerID) {
+          return info.model.providerID
+        }
       }
     } catch {
       // 会话尚未加载完时忽略
