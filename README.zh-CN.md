@@ -53,6 +53,16 @@ npx tsc   # 可选，只有修改源码后才需要
 }
 ```
 
+可选：用元组形式把侧边栏语言设为中文：
+
+```json
+{
+  "plugin": [["/path/to/oc-plugin-usage/src/tui.tsx", { "language": "zh" }]]
+}
+```
+
+`language` 支持 `"en"`（默认）和 `"zh"`（中文）。
+
 ### 4. 重启 opencode
 
 插件只在启动时加载。退出后重新运行 `opencode` —— 右侧侧边栏会出现 **Usage → Session Cache → Providers**。
@@ -87,6 +97,7 @@ Authorization: Bearer <opencode-go key>
 | `openaiApiKey` | `string` | — | 用于查询账单用量的 OpenAI API key |
 | `anthropicApiKey` | `string` | — | 用于查询用量的 Anthropic API key |
 | `usageThresholdPercent` | `number` | `80` | Toast 警告触发的用量百分比 |
+| `language`（tui 插件） | `string` | `en` | 侧边栏语言：`en` 或 `zh` |
 
 ## 收集的数据
 

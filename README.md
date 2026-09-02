@@ -55,6 +55,16 @@ Create `~/.config/opencode/tui.json` (or `~/.opencode/tui.json`):
 }
 ```
 
+Optional: set the sidebar language to Chinese with the tuple form:
+
+```json
+{
+  "plugin": [["/path/to/oc-plugin-usage/src/tui.tsx", { "language": "zh" }]]
+}
+```
+
+`language` accepts `"en"` (default) or `"zh"`.
+
 ### 4. Restart opencode
 
 Plugins load only at startup. Quit and run `opencode` again — the right sidebar
@@ -95,6 +105,7 @@ require the workspace ID or a browser cookie.
 | `openaiApiKey` | `string` | — | OpenAI API key for billing usage queries |
 | `anthropicApiKey` | `string` | — | Anthropic API key for usage queries |
 | `usageThresholdPercent` | `number` | `80` | Percentage at which toast warning fires |
+| `language` (tui plugin) | `string` | `en` | Sidebar language: `en` or `zh` |
 
 ## Data collected
 

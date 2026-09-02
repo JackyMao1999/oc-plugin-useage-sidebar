@@ -202,6 +202,79 @@ const DISPLAY_NAMES: Record<string, string> = {
   "opencode-go": "Go",
 }
 
+// ============================================================================
+// 国际化（i18n）
+// ============================================================================
+
+// 界面语言：可通过 tui.json 的插件选项配置，例如：
+//   { "plugin": [["/path/to/oc-plugin-usage/src/tui.tsx", { "language": "zh" }]] }
+type Lang = "en" | "zh"
+
+interface Strings {
+  usage: string
+  sessionCache: string
+  hitRate: string
+  input: string
+  read: string
+  write: string
+  noTurns: string
+  providers: string
+  noneConfigured: string
+  rolling5h: string
+  weekly: string
+  monthly: string
+  resets: string
+  used: string
+  cost: string
+  left: string
+  tokens: string
+  updated: string
+}
+
+function makeStrings(lang: Lang): Strings {
+  return lang === "zh"
+    ? {
+        usage: "用量",
+        sessionCache: "会话缓存",
+        hitRate: "命中率",
+        input: "输入",
+        read: "缓存读取",
+        write: "缓存写入",
+        noTurns: "暂无助手回复",
+        providers: "提供商",
+        noneConfigured: "未配置",
+        rolling5h: "最近5小时",
+        weekly: "本周",
+        monthly: "本月",
+        resets: "重置",
+        used: "已用",
+        cost: "费用",
+        left: "剩余",
+        tokens: "Token数",
+        updated: "更新",
+      }
+    : {
+        usage: "Usage",
+        sessionCache: "Session Cache",
+        hitRate: "Hit rate",
+        input: "Input",
+        read: "Read",
+        write: "Write",
+        noTurns: "No assistant turns yet",
+        providers: "Providers",
+        noneConfigured: "None configured",
+        rolling5h: "Rolling 5h",
+        weekly: "Weekly",
+        monthly: "Monthly",
+        resets: "Resets",
+        used: "used",
+        cost: "Cost",
+        left: "Left",
+        tokens: "Tokens",
+        updated: "Updated",
+      }
+}
+
 
 // ============================================================================
 // UsageSidebar 组件 — 侧边栏的核心 UI
@@ -218,13 +291,12 @@ const DISPLAY_NAMES: Record<string, string> = {
  *
  * 组件渲染的 UI 结构（从上到下）：
  *   ▼ Usage（总开关）
- *     ▼ Today        ← 今天的会话数、工具调用数等
- *     ▼ Tools        ← 最常用的工具排名（前 5 名）
- *     ▶ Period       ← 可选周期汇总（today/week/month/all）
- *     ▶ Cumulative   ← 从开始到现在的全部累计
- *     ▼ Providers    ← OpenAI/Anthropic/Go/Zen 的费用和进度条
+ *     ▼ Session Cache ← 当前会话的缓存命中率
+ *     ▼ Providers     ← OpenAI/Anthropic/Go/Zen 的费用和进度条
  */
-function UsageSidebar(props: { api: any; sessionId?: string }) {
+function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
+  // t : 当前语言的界面文案（en 或 zh，由 tui.json 的 language 选项控制）
+  const t = makeStrings(props.lang ?? "en")
 
   // -------- 响应式状态（SolidJS 的 createSignal） --------
   // createSignal 返回一个 [getter, setter] 对
@@ -420,12 +492,12 @@ function UsageSidebar(props: { api: any; sessionId?: string }) {
   const GoWindowPercent = (label: string, w: GoApiWindow) => (
     <box>
       <text fg={theme().textMuted}>
-        {label}: {w.percent.toFixed(1)}% used
+        {label}: {w.percent.toFixed(1)}% {t.used}
       </text>
       {ProgressBar(w.percent)}
       <Show when={w.resetsAt}>
         <text fg={theme().textMuted}>
-          Resets: {resetIn(w.resetsAt!)}
+          {t.resets}: {resetIn(w.resetsAt!)}
         </text>
       </Show>
     </box>
@@ -438,46 +510,46 @@ return (
     <box>
       <box flexDirection="row" gap={1} onMouseDown={() => setOpen((x) => !x)}>
         {label(open())}
-        <text fg={theme().text}><b>Usage</b></text>
+        <text fg={theme().text}><b>{t.usage}</b></text>
       </box>
       <Show when={open()}>
         <box paddingLeft={1}>
 
           <box flexDirection="row" gap={1} onMouseDown={() => setOpenCache((x) => !x)}>
             {label(openCache())}
-            <text fg={theme().text}><b>Session Cache</b></text>
+            <text fg={theme().text}><b>{t.sessionCache}</b></text>
           </box>
 
           <Show when={openCache() && cacheStats().turns > 0}>
             <box paddingLeft={2}>
               <text fg={cacheColor(cacheStats().hit)}>
-                Hit rate: {cacheStats().hit.toFixed(1)}%
+                {t.hitRate}: {cacheStats().hit.toFixed(1)}%
               </text>
               <text fg={theme().textMuted}>
-                Input:    {fmtTokens(cacheStats().input)}
+                {t.input}:    {fmtTokens(cacheStats().input)}
               </text>
               <text fg={theme().textMuted}>
-                Read:     {fmtTokens(cacheStats().read)}
+                {t.read}:     {fmtTokens(cacheStats().read)}
               </text>
               <text fg={theme().textMuted}>
-                Write:    {fmtTokens(cacheStats().write)}
+                {t.write}:    {fmtTokens(cacheStats().write)}
               </text>
             </box>
           </Show>
 
           <Show when={openCache() && cacheStats().turns === 0}>
             <text fg={theme().textMuted} paddingLeft={2}>
-              No assistant turns yet
+              {t.noTurns}
             </text>
           </Show>
 
           <box flexDirection="row" gap={1} onMouseDown={() => setOpenProviders((x) => !x)}>
             {label(openProviders())}
-            <text fg={theme().text}><b>Providers</b></text>
+            <text fg={theme().text}><b>{t.providers}</b></text>
           </box>
           <Show when={openProviders()}>
             <Show when={Object.keys(providers()).length === 0}>
-              <text fg={theme().textMuted} paddingLeft={2}>None configured</text>
+              <text fg={theme().textMuted} paddingLeft={2}>{t.noneConfigured}</text>
             </Show>
 
             <For each={Object.entries(providers())}>
@@ -486,28 +558,28 @@ return (
                   <text fg={theme().accent}>{DISPLAY_NAMES[name] || name}</text>
 
                   <Show when={name === "opencode-go" && goUsage()}>
-                    {GoWindowPercent("Rolling 5h", goUsage()!.rolling)}
-                    {GoWindowPercent("Weekly", goUsage()!.weekly)}
-                    {GoWindowPercent("Monthly", goUsage()!.monthly)}
+                    {GoWindowPercent(t.rolling5h, goUsage()!.rolling)}
+                    {GoWindowPercent(t.weekly, goUsage()!.weekly)}
+                    {GoWindowPercent(t.monthly, goUsage()!.monthly)}
                   </Show>
 
                   <Show when={name === "opencode-go" && !goUsage() && pu.goWindows}>
                     <text fg={theme().textMuted}>
-                      Rolling 5h: ${pu.goWindows!.rolling5h.cost.toFixed(2)} / ${pu.goWindows!.rolling5h.limit}
+                      {t.rolling5h}: ${pu.goWindows!.rolling5h.cost.toFixed(2)} / ${pu.goWindows!.rolling5h.limit}
                     </text>
                     {ProgressBar((pu.goWindows!.rolling5h.cost / pu.goWindows!.rolling5h.limit) * 100)}
                     <text fg={theme().textMuted}>
-                      Weekly:     ${pu.goWindows!.weekly.cost.toFixed(2)} / ${pu.goWindows!.weekly.limit}
+                      {t.weekly}:     ${pu.goWindows!.weekly.cost.toFixed(2)} / ${pu.goWindows!.weekly.limit}
                     </text>
                     {ProgressBar((pu.goWindows!.weekly.cost / pu.goWindows!.weekly.limit) * 100)}
                     <text fg={theme().textMuted}>
-                      Monthly:    ${pu.goWindows!.monthly.cost.toFixed(2)} / ${pu.goWindows!.monthly.limit}
+                      {t.monthly}:    ${pu.goWindows!.monthly.cost.toFixed(2)} / ${pu.goWindows!.monthly.limit}
                     </text>
                     {ProgressBar((pu.goWindows!.monthly.cost / pu.goWindows!.monthly.limit) * 100)}
                   </Show>
 
                   <Show when={!pu.goWindows && pu.cost != null}>
-                    <text fg={theme().textMuted}>Cost: ${pu.cost!.toFixed(2)}</text>
+                    <text fg={theme().textMuted}>{t.cost}: ${pu.cost!.toFixed(2)}</text>
                   </Show>
 
                   <Show when={!pu.goWindows && pu.limit != null && pu.limit! > 0 && pu.cost != null}>
@@ -515,11 +587,11 @@ return (
                   </Show>
 
                   <Show when={pu.remaining != null && !pu.goWindows}>
-                    <text fg={theme().textMuted}>Left: ${pu.remaining!.toFixed(2)}</text>
+                    <text fg={theme().textMuted}>{t.left}: ${pu.remaining!.toFixed(2)}</text>
                   </Show>
 
                   <Show when={pu.totalTokens != null}>
-                    <text fg={theme().textMuted}>Tokens: {pu.totalTokens!.toLocaleString()}</text>
+                    <text fg={theme().textMuted}>{t.tokens}: {pu.totalTokens!.toLocaleString()}</text>
                   </Show>
                 </box>
               )}
@@ -527,7 +599,7 @@ return (
 
             <Show when={Object.keys(providers()).length > 0 && data().lastUpdated}>
               <text fg={theme().textMuted} paddingLeft={2}>
-                Updated: {new Date(data().lastUpdated).toLocaleTimeString()}
+                {t.updated}: {new Date(data().lastUpdated).toLocaleTimeString()}
               </text>
             </Show>
           </Show>
@@ -555,7 +627,12 @@ return (
  *   - api.keymap           : 快捷键管理
  *   - api.lifecycle        : 生命周期管理（onDispose 等）
  */
-const tui: TuiPlugin = async (api) => {
+const tui: TuiPlugin = async (api, options) => {
+  // 语言选项：tui.json 里用元组形式配置
+  //   { "plugin": [["/path/to/oc-plugin-usage/src/tui.tsx", { "language": "zh" }]] }
+  // 支持 "zh"（中文）或 "en"（英文，默认）
+  const opts = (options || {}) as { language?: string }
+  const lang: Lang = opts.language === "zh" ? "zh" : "en"
   // api.slots.register() : 注册一个"插槽插件"
   // 插槽 = opencode 界面上的特定位置（比如侧边栏、Logo 区域等）
   // 你可以在这些位置插入自定义的 UI 内容
@@ -585,7 +662,7 @@ const tui: TuiPlugin = async (api) => {
        */
 sidebar_content(_ctx, props) {
         // props.session_id : 当前正在查看的会话 ID（用于计算该会话的缓存命中率）
-        return <UsageSidebar api={api} sessionId={props.session_id} />
+        return <UsageSidebar api={api} sessionId={props.session_id} lang={lang} />
       },
     },
   })
