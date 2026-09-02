@@ -347,8 +347,11 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   const [openCache, setOpenCache] = createSignal(true)    // Session Cache 区域（默认展开）
   const [openProviders, setOpenProviders] = createSignal(true) // Providers 区域（默认展开）
 
-  // goApi：官方 /zen/go/v1/usage API 的实时数据（每 5 分钟刷新）
+  // goApi：官方 /zen/go/v1/usage API 的实时数据（每 1 分钟刷新）
   const [goApi, setGoApi] = createSignal<GoApiUsage | null>(null)
+
+  // goUpdated：最近一次成功拉取官方 API 的时间戳（用于"更新"显示）
+  const [goUpdated, setGoUpdated] = createSignal<number | null>(null)
 
   // 直接调用官方 API（和 opencode.ai 工作台 /go 页面相同的数据源）
   // 无需 workspace ID 或浏览器 cookie，用 auth.json 里的 Go API key 即可
@@ -372,13 +375,14 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
           monthly: { status: u.monthly.status, percent: u.monthly.percent, resetsAt: u.monthly.resetsAt },
           lastChecked: new Date().toISOString(),
         })
+        setGoUpdated(Date.now())
       }
     } catch {
       // 网络错误或 key 无效时静默失败，回退到 JSON 文件里的数据
     }
   }
   refreshGoApi()
-  const goApiTimer = setInterval(refreshGoApi, 300000)
+  const goApiTimer = setInterval(refreshGoApi, 60000)
   onCleanup(() => clearInterval(goApiTimer))
 
   // -------- 主题 --------
@@ -597,14 +601,18 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
     return String(n)
   }
 
-  // resetIn: 计算距离重置时间的倒计时
-  //   例：resetIn("2026-07-18T12:00:00Z") → "3.2h"、"45m" 或 "4.5d"（超过 24 小时显示天）
+  // resetIn: 计算距离重置时间的倒计时（精确到分钟）
+  //   例：resetIn("2026-07-18T12:00:00Z") → "3h 42m"、"45m" 或 "4d 12h"（超过 24 小时显示天 + 小时）
   const resetIn = (iso: string) => {
     const diff = new Date(iso).getTime() - Date.now()
     if (diff <= 0) return "now"
-    const hours = diff / 3600000
-    if (hours >= 24) return `${(hours / 24).toFixed(1)}d`
-    return hours >= 1 ? `${hours.toFixed(1)}h` : `${Math.round(diff / 60000)}m`
+    const totalMinutes = Math.round(diff / 60000)
+    const days = Math.floor(totalMinutes / 1440)
+    const hours = Math.floor((totalMinutes % 1440) / 60)
+    const minutes = totalMinutes % 60
+    if (days > 0) return `${days}d ${hours}h`
+    if (hours > 0) return `${hours}h ${minutes}m`
+    return `${minutes}m`
   }
 
   // GoWindowPercent: 一个官方 API 时间窗口的渲染
@@ -717,7 +725,13 @@ return (
               )}
             </For>
 
-            <Show when={data().lastUpdated}>
+            {/* Go 数据在显示时，用真正的 API 拉取时间；否则用数据文件的保存时间 */}
+            <Show when={goUsage() && goUpdated()}>
+              <text fg={theme().textMuted} paddingLeft={2}>
+                {t.updated}: {new Date(goUpdated()!).toLocaleTimeString(undefined, { hour12: false })}
+              </text>
+            </Show>
+            <Show when={!goUsage() && data().lastUpdated}>
               <text fg={theme().textMuted} paddingLeft={2}>
                 {t.updated}: {new Date(data().lastUpdated).toLocaleTimeString(undefined, { hour12: false })}
               </text>

@@ -8,7 +8,7 @@ import { homedir } from "os";
 const CONFIG = {
   thresholdPercent: 80,
   saveIntervalMs: 30000,
-  providerCheckIntervalMs: 300000,
+  providerCheckIntervalMs: 60000,
   dataFileName: "oc-plugin-usage-data.json",
 };
 
