@@ -13,7 +13,28 @@ AI model usage monitoring plugin for [opencode](https://opencode.ai). Tracks ses
 
 ## Install
 
-### Via opencode.json
+### 1. Clone / copy the plugin
+
+```bash
+git clone git@github.com:JackyMao1999/oc-plugin-useage.git
+# or copy the folder anywhere, e.g. ~/.opencode/plugins/oc-plugin-usage
+```
+
+Install dependencies (for local development / `tsc`):
+
+```bash
+cd oc-plugin-usage
+npm install
+npx tsc   # optional, only if you edit the source
+```
+
+### 2. Register the server plugin (opencode.json)
+
+**Important:** use the absolute path to `src/index.ts`. Do **NOT** use the bare
+name `"oc-plugin-usage"` — that resolves to an unrelated npm package, not this
+plugin.
+
+Global config (`~/.config/opencode/opencode.json`, or `~/.opencode/opencode.json`):
 
 ```json
 {
@@ -21,6 +42,37 @@ AI model usage monitoring plugin for [opencode](https://opencode.ai). Tracks ses
   "plugin": ["/path/to/oc-plugin-usage/src/index.ts"]
 }
 ```
+
+### 3. Register the sidebar (TUI) plugin (tui.json)
+
+Create `~/.config/opencode/tui.json` (or `~/.opencode/tui.json`):
+
+```json
+{
+  "plugin": ["/path/to/oc-plugin-usage/src/tui.tsx"]
+}
+```
+
+### 4. Restart opencode
+
+Plugins load only at startup. Quit and run `opencode` again — the right sidebar
+will show **Usage → Session Cache → Providers**.
+
+### Workspace / Go plan
+
+No workspace configuration is needed. The sidebar fetches your Go plan usage
+from the official API:
+
+```
+GET https://opencode.ai/zen/go/v1/usage
+Authorization: Bearer <opencode-go key>
+```
+
+The `opencode-go` API key is read automatically from
+`~/.local/share/opencode/auth.json`, so any user who has logged in with an
+OpenCode Go plan works out of the box. The web dashboard equivalent is
+`https://opencode.ai/workspace/<your-workspace-id>/go`, but the plugin does not
+require the workspace ID or a browser cookie.
 
 ### With provider API keys (optional)
 
@@ -32,13 +84,6 @@ AI model usage monitoring plugin for [opencode](https://opencode.ai). Tracks ses
     "usageThresholdPercent": 80
   }]]
 }
-```
-
-### Auto-discovery (project-level)
-
-```bash
-# Copy compiled plugin to project's plugin directory
-cp dist/index.js /path/to/your/project/.opencode/plugins/usage-plugin.js
 ```
 
 ## Options
