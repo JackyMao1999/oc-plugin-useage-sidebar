@@ -317,7 +317,7 @@ interface ProviderMeta {
 const PROVIDER_META: ProviderMeta[] = [
   { id: "opencode-go", name: "opencode", color: "#3b82f6", glyph: "◆" },
   { id: "opencode", name: "Zen", color: "#8b5cf6", glyph: "◈" },
-  { id: "openai", name: "ChatGPT", color: "#10a37f", glyph: "●" },
+  { id: "openai", name: "OpenAI", color: "#10a37f", glyph: "●" },
   { id: "anthropic", name: "Claude", color: "#d97757", glyph: "◉" },
   { id: "google", name: "Gemini", color: "#4285f4", glyph: "◆" },
   { id: "codex", name: "Codex", color: "#64748b", glyph: "✦" },
@@ -473,11 +473,12 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
     return ids
   })
 
-  // knownProviders : 热门提供商列表 + 状态
+  // knownProviders : 提供商列表 + 状态
   //   active     : 当前会话正在使用的 provider（accent 高亮）
   //   configured : auth.json 里有没有这个 provider 的 key
   //   pu         : 数据文件里有该 provider 的用量数据（有则显示明细）
-  //   排序：当前正在使用的排在最前面
+  //   筛选规则：检测到当前使用的提供商时，只显示它（用哪个就显示哪个）；
+  //   新会话还没回复（检测不到）时，回退显示已配置/有数据的提供商
   const knownProviders = createMemo(() => {
     const puMap = providers()
     const keys = readAuthKeys()
@@ -503,9 +504,10 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
         })
       }
     }
-    // 当前使用的 provider 排最前
-    list.sort((a, b) => (b.active ? 1 : 0) - (a.active ? 1 : 0))
-    return list
+    // 有活跃提供商：只显示活跃的；否则显示已配置或有数据的
+    const activeList = list.filter((p) => p.active)
+    if (activeList.length > 0) return activeList
+    return list.filter((p) => p.configured || p.pu)
   })
 
   // hasActiveProvider : 是否检测到当前使用的提供商（新会话还没回复时可能为空）
@@ -749,6 +751,9 @@ return (
             <text fg={theme().text}><b>🌐 {t.providers}</b></text>
           </box>
           <Show when={openProviders()}>
+            <Show when={knownProviders().length === 0}>
+              <text fg={theme().textMuted} paddingLeft={2}>{t.noneConfigured}</text>
+            </Show>
             <For each={knownProviders()}>
               {(p) => (
                 <box paddingLeft={2}>
