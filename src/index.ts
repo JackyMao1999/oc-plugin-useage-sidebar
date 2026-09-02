@@ -270,7 +270,7 @@ const DISPLAY_NAMES: Record<string, string> = {
   openai: "OpenAI",
   anthropic: "Anthropic",
   opencode: "Zen",
-  "opencode-go": "Go",
+  "opencode-go": "opencode",
 };
 
 interface PluginOptions {
@@ -374,9 +374,10 @@ function formatStats(stats: ReturnType<typeof aggregate>, period: string): strin
 
 function formatProviderUsage(pu: ProviderUsage, label: string): string {
   const lines: string[] = [`--- ${label} ---`];
+  const fmtPct = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(1));
   if (pu.chatgpt) {
     const fmt = (w: GoApiWindow) =>
-      `${w.percent.toFixed(1)}% used${w.resetsAt ? ` (resets ${new Date(w.resetsAt).toLocaleString()})` : ""}`;
+      `${fmtPct(w.percent)}% used${w.resetsAt ? ` (resets ${new Date(w.resetsAt).toLocaleString()})` : ""}`;
     if (pu.chatgpt.planType) lines.push(`  Plan:       ${pu.chatgpt.planType}`);
     lines.push(`  5h:         ${fmt(pu.chatgpt.primary)}`);
     lines.push(`  Weekly:     ${fmt(pu.chatgpt.secondary)}`);
@@ -384,7 +385,8 @@ function formatProviderUsage(pu: ProviderUsage, label: string): string {
   }
   if (pu.goApi) {
     const fmt = (w: GoApiWindow) =>
-      `${w.percent.toFixed(1)}% used${w.resetsAt ? ` (resets ${new Date(w.resetsAt).toLocaleString()})` : ""}`;
+      `${fmtPct(w.percent)}% used${w.resetsAt ? ` (resets ${new Date(w.resetsAt).toLocaleString()})` : ""}`;
+    lines.push(`  Plan:       Go`);
     lines.push(`  Rolling 5h: ${fmt(pu.goApi.rolling)}`);
     lines.push(`  Weekly:     ${fmt(pu.goApi.weekly)}`);
     lines.push(`  Monthly:    ${fmt(pu.goApi.monthly)}`);

@@ -315,7 +315,7 @@ interface ProviderMeta {
 }
 
 const PROVIDER_META: ProviderMeta[] = [
-  { id: "opencode-go", name: "Go", color: "#3b82f6", glyph: "◆" },
+  { id: "opencode-go", name: "opencode", color: "#3b82f6", glyph: "◆" },
   { id: "opencode", name: "Zen", color: "#8b5cf6", glyph: "◈" },
   { id: "openai", name: "ChatGPT", color: "#10a37f", glyph: "●" },
   { id: "anthropic", name: "Claude", color: "#d97757", glyph: "◉" },
@@ -585,8 +585,12 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
     return s + " ".repeat(pad)
   }
 
-  // BarRow: 一行"标签 + 色块进度条 + 百分比"
-  //   例：最近5小时  ██████░░ 66.0%
+  // fmtPct: 百分比格式化 —— 整数不带小数点（API 返回整数时避免假的 ".0"），
+//   有小数时保留 1 位（如 12% / 12.3%）
+const fmtPct = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(1))
+
+// BarRow: 一行"标签 + 色块进度条 + 百分比"
+  //   例：最近5小时  ██████░░ 66%
   const BarRow = (labelText: string, pct: number, color: string) => {
     const barLen = 8
     const filled = Math.round((pct / 100) * barLen)
@@ -596,7 +600,7 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
         <text fg={color}>
           {"█".repeat(filled)}{"░".repeat(Math.max(0, barLen - filled))}
         </text>
-        <text fg={color}>{pct.toFixed(1)}%</text>
+        <text fg={color}>{fmtPct(pct)}%</text>
       </box>
     )
   }
@@ -657,6 +661,7 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   const ProviderDetails = (id: string, pu?: ProviderUsage) => (
     <box paddingLeft={2}>
       <Show when={id === "opencode-go" && goUsage()}>
+        {InfoRow(t.plan, "Go")}
         {GoWindowPercent(t.rolling5h, goUsage()!.rolling)}
         {GoWindowPercent(t.weekly, goUsage()!.weekly)}
         {GoWindowPercent(t.monthly, goUsage()!.monthly)}
@@ -675,7 +680,7 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
       {/* ChatGPT（wham/usage）：计划 + 5小时/每周窗口 + 余额 */}
       <Show when={id === "openai" && pu?.chatgpt}>
         <Show when={pu!.chatgpt!.planType}>
-          {InfoRow(t.plan, pu!.chatgpt!.planType!)}
+          {InfoRow(t.plan, pu!.chatgpt!.planType!.charAt(0).toUpperCase() + pu!.chatgpt!.planType!.slice(1))}
         </Show>
         {GoWindowPercent(t.rolling5h, pu!.chatgpt!.primary)}
         {GoWindowPercent(t.weekly, pu!.chatgpt!.secondary)}
@@ -723,6 +728,7 @@ return (
               {InfoRow(t.write, fmtTokens(cacheStats().write))}
             </box>
           </Show>
+          {/* 上面的命中率经 BarRow 用 fmtPct 格式化：整数不带 .0 */}
 
           <Show when={openCache() && cacheStats().turns === 0}>
             <text fg={theme().textMuted} paddingLeft={2}>
