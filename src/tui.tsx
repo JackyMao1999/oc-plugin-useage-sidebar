@@ -76,9 +76,8 @@ import { homedir } from "os"
 // Server 插件（index.ts）把用量数据写入这个文件，TUI 插件从这里读取
 const DATA_FILE = join(homedir(), ".opencode", "oc-plugin-usage-data.json")
 
-// 阈值配置文件 + 调整快捷键
+// 阈值配置文件（调整快捷键见下方 thresholdKeyHint）
 const CONFIG_FILE = join(homedir(), ".opencode", "oc-plugin-usage-config.json")
-const THRESHOLD_KEY = "ctrl+shift+u"
 
 // 读取用量提醒阈值（%）：文件（手动调整） > 默认 80
 function readThresholdFile(): number {
@@ -473,7 +472,8 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   const [threshold, setThreshold] = createSignal(readThresholdFile())
 
   // thresholdKeyHint：调整阈值的快捷键提示
-  const thresholdKeyHint = "Ctrl+Shift+U"
+  //  Ctrl+O 在任意终端都有独立编码，不会被系统/终端拦截（Ctrl+Shift+U 在 Ubuntu/GNOME 被占用）
+  const thresholdKeyHint = "Ctrl+O"
 
   // 直接调用官方 API（和 opencode.ai 工作台 /go 页面相同的数据源）
   // 无需 workspace ID 或浏览器 cookie，用 auth.json 里的 Go API key 即可
@@ -841,11 +841,12 @@ return (
               )}
             </For>
 
-            {/* 提醒阈值：Ctrl+Alt+U 或命令面板调整 */}
+            {/* 提醒阈值：与其他百分比行同列对齐（浅色满格表示"界限"，非用量） */}
             <box flexDirection="row" gap={1} paddingLeft={2}>
-              <text fg={theme().textMuted}>{t.threshold}:</text>
-              <text fg={theme().accent}><b>{threshold()}%</b></text>
-              <text fg={theme().textMuted}>({t.adjustThreshold}: {thresholdKeyHint})</text>
+              <text fg={theme().textMuted}>{padLabel(t.threshold)}</text>
+              <text fg={theme().textMuted}>{"█".repeat(8)}</text>
+              <text fg={theme().accent}><b>{fmtPct(threshold())}%</b></text>
+              <text fg={theme().textMuted}>· {thresholdKeyHint}</text>
             </box>
 
             {/* Go 数据在显示时，用真正的 API 拉取时间；否则用数据文件的保存时间 */}
@@ -1007,7 +1008,7 @@ const tui: TuiPlugin = async (api, options) => {
   const lang: Lang = opts.language === "zh" ? "zh" : "en"
   const t = makeStrings(lang)
 
-  // 调整提醒阈值的对话框（Ctrl+Alt+U 或命令面板触发）
+  // 调整提醒阈值的对话框（Ctrl+O 或命令面板触发）
   const DialogPrompt = api.ui.DialogPrompt
   function openThresholdDialog() {
     const current = readThresholdFile()
@@ -1049,7 +1050,7 @@ const tui: TuiPlugin = async (api, options) => {
     },
   ])
 
-  // 快捷键层：Ctrl+Shift+U 触发同一个对话框（终端不支持组合键时可用命令面板）
+  // 快捷键层：Ctrl+O 触发同一个对话框（终端不支持组合键时可用命令面板）
   // 注意：keymap 的修饰键只有 ctrl/shift/meta/super/hyper，没有 alt
   try {
     api.keymap.registerLayer({
@@ -1067,7 +1068,7 @@ const tui: TuiPlugin = async (api, options) => {
   }
   try {
     api.keymap.registerLayer({
-      bindings: [{ key: "ctrl+shift+u", cmd: "oc-plugin-usage.set-threshold" }],
+      bindings: [{ key: "ctrl+o", cmd: "oc-plugin-usage.set-threshold" }],
     })
   } catch {
     // 绑定键解析失败（终端不支持）时忽略
