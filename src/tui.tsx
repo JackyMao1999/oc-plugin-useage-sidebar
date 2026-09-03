@@ -110,13 +110,13 @@ function fmtPct(n: number): string {
 // 已提醒过的百分比（跨组件共享，状态栏组件负责检查）
 //   只在"跨越阈值"时提醒一次，避免每轮刷新都弹：
 //   1. 首次达到阈值 → 提醒
-//   2. 比上次提醒高了 ≥10 个百分点 → 提醒（80→90→100 逐步升级）
+//   2. 比上次提醒高了 ≥5 个百分点 → 提醒（50→55→60… 逐步升级）
 //   3. 上次提醒时还没到阈值（阈值被调低了）→ 提醒
 const lastNotified = new Map<string, number>()
 function crossedThreshold(key: string, pct: number, threshold: number): boolean {
   const last = lastNotified.get(key)
   if (pct < threshold) return false
-  if (last === undefined || last < threshold || pct >= last + 10) {
+  if (last === undefined || last < threshold || pct >= last + 5) {
     lastNotified.set(key, pct)
     return true
   }
@@ -873,7 +873,7 @@ return (
 // ============================================================================
 
 // checkAllAlerts : 检查所有提供商是否跨越了提醒阈值
-//   跨越时用 api.attention.notify 发系统通知（+ 声音）
+//   跨越时弹 TUI toast + 发系统通知（+ 声音）
 //   由下面的 UsageStatusBar 每 30 秒调用一次
 async function checkAllAlerts(api: any, data: UsageData, t: Strings, threshold: number) {
   if (!api?.attention?.notify) return
@@ -902,10 +902,18 @@ async function checkAllAlerts(api: any, data: UsageData, t: Strings, threshold: 
     }
   }
   for (const a of alerts) {
+    const title = `${t.alertTitle}: ${a.name}`
+    const message = t.alertMessage(a.name, a.pct, threshold)
+    const variant = a.pct >= 100 ? "error" : "warning"
+    try {
+      api.ui?.toast?.({ variant, title, message })
+    } catch {
+      // toast 不可用时静默失败
+    }
     try {
       await api.attention.notify({
-        title: `${t.alertTitle}: ${a.name}`,
-        message: t.alertMessage(a.name, a.pct, threshold),
+        title,
+        message,
         notification: true,
         sound: { name: a.pct >= 100 ? "error" : "default" },
       })
