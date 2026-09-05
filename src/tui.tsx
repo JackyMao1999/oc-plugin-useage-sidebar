@@ -841,10 +841,9 @@ return (
               )}
             </For>
 
-            {/* 提醒阈值：与其他百分比行同列对齐（浅色满格表示"界限"，非用量） */}
+            {/* 提醒阈值：只显示数值，不绘制进度条 */}
             <box flexDirection="row" gap={1} paddingLeft={2}>
               <text fg={theme().textMuted}>{padLabel(t.threshold)}</text>
-              <text fg={theme().textMuted}>{"█".repeat(8)}</text>
               <text fg={theme().accent}><b>{fmtPct(threshold())}%</b></text>
               <text fg={theme().textMuted}>· {thresholdKeyHint}</text>
             </box>
