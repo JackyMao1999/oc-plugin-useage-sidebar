@@ -115,15 +115,81 @@ interface ProviderUsage {
   goWindows?: GoWindows;
   goApi?: GoApiUsage;
   chatgpt?: ChatGptUsage;
+  tokenrhythm?: TokenRhythmUsage;
+}
+
+// TokenRhythm（tokenrhythm.studio）账户用量 —— 来自 /api/wallet/summary 和 /api/usage-summary
+// 与账户页（/account/account）的"实际可用总额"和"总成本（已产生费用）"同源
+interface TokenRhythmUsage {
+  availableBalance?: number; // 实际可用总额（CNY）
+  currency?: string;         // 币种，默认 CNY
+  totalCost?: number;        // 累计成本（已产生费用，CNY）
+  calls?: number;            // 累计调用次数
+  authExpired?: boolean;     // Cookie 失效（401），数据为旧值
+  lastChecked?: string;
 }
 
 // ChatGPT (chatgpt.com) 用量 —— 来自 backend-api/wham/usage
 interface ChatGptUsage {
   planType?: string;
   primary: GoApiWindow;    // 5 小时窗口
-  secondary: GoApiWindow;  // 每周窗口
-  credits?: number;        // 余额（美元）
+  secondary?: GoApiWindow; // 每周窗口（部分账号可能没有）
+  credits?: number;        // 剩余 Credits
+  creditUsage?: ChatGptCreditUsage;
   lastChecked?: string;
+}
+
+interface CreditUsageBreakdown {
+  codex: number;
+  work: number;
+  total: number;
+}
+
+interface ChatGptCreditUsage {
+  daily: Record<string, CreditUsageBreakdown>;
+  last7Days: CreditUsageBreakdown;
+  lastChecked?: string;
+}
+
+interface CreditUsageEvent {
+  date?: string;
+  product_surface?: string;
+  credit_amount?: number | string;
+}
+
+function emptyCreditUsageBreakdown(): CreditUsageBreakdown {
+  return { codex: 0, work: 0, total: 0 };
+}
+
+// 与 Codex Cloud Analytics 的个人账号页面保持一致：按 surface 分为 Codex / Work，直接累加 Credits。
+function aggregateCreditUsage(events: unknown): ChatGptCreditUsage {
+  const daily: Record<string, CreditUsageBreakdown> = {};
+  const cutoff = dateNDaysAgo(7);
+  if (Array.isArray(events)) {
+    for (const raw of events) {
+      if (!raw || typeof raw !== "object") continue;
+      const event = raw as CreditUsageEvent;
+      const date = typeof event.date === "string" ? event.date.slice(0, 10) : "";
+      const amount = Number(event.credit_amount);
+      if (!date || date < cutoff || !Number.isFinite(amount)) continue;
+
+      const day = daily[date] || (daily[date] = emptyCreditUsageBreakdown());
+      const bucket = typeof event.product_surface === "string" && event.product_surface.startsWith("work_")
+        ? "work"
+        : "codex";
+      day[bucket] += amount;
+      day.total += amount;
+    }
+  }
+
+  const last7Days = emptyCreditUsageBreakdown();
+  for (const day of Object.values(daily)) {
+    last7Days.codex += day.codex;
+    last7Days.work += day.work;
+    last7Days.total += day.total;
+  }
+
+  return { daily, last7Days, lastChecked: new Date().toISOString() };
 }
 
 const GO_LIMITS = {
@@ -196,10 +262,10 @@ async function checkGoUsage(apiKey: string): Promise<GoApiUsage | null> {
 // ChatGPT OAuth 客户端 ID（与 Codex CLI 一致，用于刷新 access token）
 const CHATGPT_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 
-// 内存中缓存的 ChatGPT access token（不写回 auth.json，避免和 opencode 的 token 管理冲突）
-let chatGptToken: { access: string; expires: number } | null = null;
-
-async function refreshChatGptToken(refresh: string): Promise<{ access: string; expires: number } | null> {
+// 通过 refresh token 换取 access token，并把新的 token 写回 auth.json。
+// OpenAI 的 refresh token 是一次性的（旋转）：一旦被消费，旧的 refresh token 立即失效。
+// 因此必须把刷新结果写回 auth.json，否则 opencode 与插件会互相把对方的 refresh token 弄失效。
+async function refreshChatGptToken(refresh: string): Promise<{ access: string; expires: number; refresh: string } | null> {
   try {
     const resp = await fetch("https://auth.openai.com/oauth/token", {
       method: "POST",
@@ -209,46 +275,163 @@ async function refreshChatGptToken(refresh: string): Promise<{ access: string; e
     if (!resp.ok) return null;
     const json: any = await resp.json();
     if (!json?.access_token) return null;
-    return { access: json.access_token, expires: Date.now() + (json.expires_in || 3600) * 1000 };
+    const next = {
+      access: json.access_token,
+      expires: Date.now() + (json.expires_in || 3600) * 1000,
+      refresh: json.refresh_token || refresh,
+    };
+    try {
+      const authPath = join(homedir(), ".local", "share", "opencode", "auth.json");
+      if (existsSync(authPath)) {
+        const auth = JSON.parse(readFileSync(authPath, "utf-8"));
+        if (auth["openai"]) {
+          auth["openai"].access = next.access;
+          auth["openai"].refresh = next.refresh;
+          auth["openai"].expires = next.expires;
+          writeFileSync(authPath, JSON.stringify(auth, null, 2));
+        }
+      }
+    } catch {
+      // 写回失败不影响本次查询（token 已在内存中）
+    }
+    return next;
   } catch {
     return null;
   }
 }
 
+function chatGptAccountHeaders(accountId?: string): Record<string, string> {
+  const id = accountId?.trim();
+  return id && id !== "personal" ? { "ChatGPT-Account-ID": id } : {};
+}
+
 // 查询 ChatGPT 用量（chatgpt.com 后台的 wham/usage，与 Codex Cloud 分析页同一数据源）
-async function checkChatGPTUsage(): Promise<ChatGptUsage | null> {
+async function checkChatGPTUsage(accountId?: string): Promise<ChatGptUsage | null> {
   try {
     const authPath = join(homedir(), ".local", "share", "opencode", "auth.json");
     if (!existsSync(authPath)) return null;
     const auth = JSON.parse(readFileSync(authPath, "utf-8"));
     const oa = auth["openai"];
-    if (!oa?.refresh || !oa?.accountId) return null;
+    if (!oa) return null;
 
-    // token 过期前 5 分钟提前刷新
-    if (!chatGptToken || chatGptToken.expires < Date.now() + 5 * 60 * 1000) {
-      chatGptToken = await refreshChatGptToken(oa.refresh);
-      if (!chatGptToken) return null;
+    // 优先使用 auth.json 里 opencode 维护的 access token（opencode 会在后台刷新并写回）。
+    // 不要单独用缓存的 refresh token 刷新：OpenAI 的 refresh token 是一次性的，
+    // 插件抢先刷新会消耗掉 opencode 手里的 refresh token，导致两边都用不了，
+    // 从而造成用量百分比一直停留在旧值。
+    let access: string | null =
+      typeof oa.access === "string" && oa.access ? oa.access : null;
+    const expires = Number(oa.expires);
+    if (access && (!Number.isFinite(expires) || expires < Date.now() + 5 * 60 * 1000)) {
+      access = null; // access token 缺失或即将过期，走 refresh 分支
+    }
+    if (!access) {
+      if (typeof oa.refresh !== "string" || !oa.refresh) return null;
+      const refreshed = await refreshChatGptToken(oa.refresh);
+      if (!refreshed) return null;
+      access = refreshed.access;
     }
 
-    const resp = await fetch("https://chatgpt.com/backend-api/wham/usage", {
-      headers: {
-        Authorization: `Bearer ${chatGptToken.access}`,
-        "ChatGPT-Account-Id": oa.accountId,
-      },
-    });
+    const headers = {
+      Authorization: `Bearer ${access}`,
+      ...chatGptAccountHeaders(accountId),
+    };
+    const [resp, creditsResp] = await Promise.all([
+      fetch("https://chatgpt.com/backend-api/wham/usage", { headers }),
+      fetch("https://chatgpt.com/backend-api/wham/usage/credit-usage-events", { headers }).catch(() => null),
+    ]);
     if (!resp.ok) return null;
     const json: any = await resp.json();
     const rl = json?.rate_limit;
     if (!rl?.primary_window) return null;
-    const window = (x: any): GoApiWindow => ({
-      percent: x?.used_percent ?? 0,
-      resetsAt: x?.reset_at ? new Date((x.reset_at as number) * 1000).toISOString() : undefined,
-    });
+    const window = (x: any): GoApiWindow | undefined => {
+      if (!x) return undefined;
+      const percent = Number(x.used_percent);
+      if (!Number.isFinite(percent)) return undefined;
+      const resetAt = Number(x.reset_at);
+      return {
+        status: typeof x.status === "string" ? x.status : undefined,
+        percent,
+        resetsAt: Number.isFinite(resetAt) && resetAt > 0 ? new Date(resetAt * 1000).toISOString() : undefined,
+      };
+    };
+    const primary = window(rl.primary_window);
+    if (!primary) return null;
+    let creditUsage: ChatGptCreditUsage | undefined;
+    if (creditsResp?.ok) {
+      try {
+        creditUsage = aggregateCreditUsage((await creditsResp.json())?.data);
+      } catch {
+        // Analytics 数据异常时不影响限额窗口显示。
+      }
+    }
     return {
       planType: json?.plan_type,
-      primary: window(rl.primary_window),
+      primary,
       secondary: window(rl.secondary_window),
-      credits: json?.credits?.has_credits ? parseFloat(json.credits.balance) : undefined,
+      credits: json?.credits?.balance != null && Number.isFinite(Number(json.credits.balance))
+        ? Number(json.credits.balance)
+        : undefined,
+      creditUsage,
+      lastChecked: new Date().toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// TokenRhythm 会话 Cookie：优先用插件选项 tokenrhythmCookie，其次读
+// ~/.opencode/tokenrhythm-cookie.txt（把浏览器里 /api 请求的整个 Cookie 头粘进去即可）
+function readTokenRhythmCookie(opts: PluginOptions): string | null {
+  const fromOption = opts.tokenrhythmCookie?.trim();
+  if (fromOption) return fromOption;
+  try {
+    const cookieFile = join(homedir(), ".opencode", "tokenrhythm-cookie.txt");
+    if (existsSync(cookieFile)) {
+      const c = readFileSync(cookieFile, "utf-8").trim();
+      if (c) return c;
+    }
+  } catch {
+    // 读取失败当作未配置
+  }
+  return null;
+}
+
+// 查询 TokenRhythm 账户数据（钱包余额 + 用量汇总，和 /account/account 页面同源）。
+// 该站的管理 API 只认浏览器登录会话（Cookie），不支持 API key 认证。
+async function checkTokenRhythmUsage(cookie: string): Promise<TokenRhythmUsage | null> {
+  const num = (v: unknown): number | undefined => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  try {
+    const headers = { Cookie: cookie, Accept: "application/json" };
+    const [walletResp, usageResp] = await Promise.all([
+      fetch("https://tokenrhythm.studio/api/wallet/summary", { headers }),
+      fetch("https://tokenrhythm.studio/api/usage-summary", { headers }),
+    ]);
+    if (walletResp.status === 401 || usageResp.status === 401) {
+      return { authExpired: true, lastChecked: new Date().toISOString() };
+    }
+    if (!walletResp.ok && !usageResp.ok) return null;
+    // 响应可能是 {code,message,data} 包装，也可能是裸对象
+    const unwrap = async (resp: Response): Promise<any> => {
+      try {
+        const json: any = await resp.json();
+        return json?.data && typeof json.data === "object" ? json.data : json;
+      } catch {
+        return null;
+      }
+    };
+    const wallet = walletResp.ok ? await unwrap(walletResp) : null;
+    const usage = usageResp.ok ? await unwrap(usageResp) : null;
+    const availableBalance = num(wallet?.availableBalanceCny);
+    const totalCost = num(usage?.costCny);
+    if (availableBalance == null && totalCost == null) return null;
+    return {
+      availableBalance,
+      currency: typeof wallet?.currency === "string" ? wallet.currency : "CNY",
+      totalCost,
+      calls: num(usage?.calls),
       lastChecked: new Date().toISOString(),
     };
   } catch {
@@ -302,12 +485,15 @@ const DISPLAY_NAMES: Record<string, string> = {
   anthropic: "Anthropic",
   opencode: "Zen",
   "opencode-go": "opencode",
+  tokenrhythm: "TokenRhythm",
 };
 
 interface PluginOptions {
   openaiApiKey?: string;
   anthropicApiKey?: string;
   goApiKey?: string;
+  chatGptAccountId?: string;
+  tokenrhythmCookie?: string;
   usageThresholdPercent?: number;
 }
 
@@ -411,8 +597,22 @@ function formatProviderUsage(pu: ProviderUsage, label: string): string {
       `${fmtPct(w.percent)}% used${w.resetsAt ? ` (resets ${new Date(w.resetsAt).toLocaleString()})` : ""}`;
     if (pu.chatgpt.planType) lines.push(`  Plan:       ${pu.chatgpt.planType}`);
     lines.push(`  5h:         ${fmt(pu.chatgpt.primary)}`);
-    lines.push(`  Weekly:     ${fmt(pu.chatgpt.secondary)}`);
-    if (pu.chatgpt.credits != null) lines.push(`  Balance:    $${pu.chatgpt.credits.toFixed(2)}`);
+    if (pu.chatgpt.secondary) lines.push(`  Weekly:     ${fmt(pu.chatgpt.secondary)}`);
+    if (pu.chatgpt.credits != null) lines.push(`  Credits:    ${pu.chatgpt.credits.toFixed(1)}`);
+    if (pu.chatgpt.creditUsage) {
+      lines.push(`  Credits 7d: ${pu.chatgpt.creditUsage.last7Days.total.toFixed(1)}`);
+      lines.push(`    Codex:    ${pu.chatgpt.creditUsage.last7Days.codex.toFixed(1)}`);
+      lines.push(`    Work:     ${pu.chatgpt.creditUsage.last7Days.work.toFixed(1)}`);
+    }
+  }
+  if (pu.tokenrhythm) {
+    const tr = pu.tokenrhythm;
+    const money = (n: number, currency?: string) =>
+      currency && currency !== "CNY" ? `${n.toFixed(2)} ${currency}` : `¥${n.toFixed(2)}`;
+    if (tr.availableBalance != null) lines.push(`  Available:  ${money(tr.availableBalance, tr.currency)}`);
+    if (tr.totalCost != null) lines.push(`  Total cost: ${money(tr.totalCost, tr.currency)}`);
+    if (tr.calls != null) lines.push(`  Calls:      ${tr.calls.toLocaleString()}`);
+    if (tr.authExpired) lines.push(`  Note:       session cookie expired, showing stale data`);
   }
   if (pu.goApi) {
     const fmt = (w: GoApiWindow) =>
@@ -554,7 +754,7 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
     const poll = async () => {
       const pu = await checkOpenAIUsage(opts.openaiApiKey!);
       if (!pu) return;
-      data.providerUsage.openai = pu;
+      data.providerUsage.openai = { ...data.providerUsage.openai, ...pu };
       markDirty();
       if (pu.limit != null && pu.cost != null && pu.limit > 0) {
         const pct = (pu.cost / pu.limit) * 100;
@@ -616,13 +816,15 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
 
   // ChatGPT 用量轮询（OAuth 登录，无需 API key）
   const pollChatGpt = async () => {
-    const usage = await checkChatGPTUsage();
+    const usage = await checkChatGPTUsage(opts.chatGptAccountId);
     if (!usage) return;
     const pu = data.providerUsage["openai"] || { lastChecked: new Date().toISOString() };
     pu.chatgpt = usage;
     data.providerUsage["openai"] = pu;
     markDirty();
-    for (const [name, w] of Object.entries({ "5h": usage.primary, Weekly: usage.secondary })) {
+    const windows: Record<string, GoApiWindow> = { "5h": usage.primary };
+    if (usage.secondary) windows.Weekly = usage.secondary;
+    for (const [name, w] of Object.entries(windows)) {
       if (crossedThreshold(`chatgpt.${name}`, w.percent, readThresholdFile())) {
         await tryShowToast(ctx, `ChatGPT ${name}: ${w.percent.toFixed(0)}% used`, w.percent >= 100 ? "error" : "warning");
       }
@@ -630,6 +832,25 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
   };
   pollChatGpt();
   setInterval(pollChatGpt, CONFIG.providerCheckIntervalMs);
+
+  // TokenRhythm 账户数据轮询（需要浏览器会话 Cookie，未配置时跳过）
+  const tokenRhythmCookie = readTokenRhythmCookie(opts);
+  if (tokenRhythmCookie) {
+    const pollTokenRhythm = async () => {
+      // Cookie 文件可能被用户随时更新，每轮重新读取
+      const cookie = readTokenRhythmCookie(opts);
+      if (!cookie) return;
+      const usage = await checkTokenRhythmUsage(cookie);
+      if (!usage) return;
+      // 合并写入，保留 message 事件累计的 cost 等字段
+      const pu = data.providerUsage["tokenrhythm"] || { lastChecked: new Date().toISOString() };
+      pu.tokenrhythm = usage;
+      data.providerUsage["tokenrhythm"] = pu;
+      markDirty();
+    };
+    pollTokenRhythm();
+    setInterval(pollTokenRhythm, CONFIG.providerCheckIntervalMs);
+  }
 
   const cleanupInterval = setInterval(() => {
     if (trackedCosts.size > 10000) trackedCosts.clear();

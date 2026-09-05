@@ -8,7 +8,8 @@
 
 - **会话缓存命中率** — 实时统计当前会话的 `cache read / (input + read)`，显示 Hit rate、Input、Read、Write
 - **Go 套餐用量** — 通过官方 API 显示 Rolling 5h / Weekly / Monthly 的已用百分比 + 重置倒计时（超过 24 小时自动显示为天）
-- **ChatGPT 用量** — 读取 ChatGPT 后台接口（`chatgpt.com/backend-api/wham/usage`，与 Codex Cloud 分析页同源），显示计划类型、5小时/每周限额窗口和余额；用标准 OpenAI OAuth 登录即可，无需 API key，access token 自动刷新
+- **ChatGPT 用量** — 读取 ChatGPT 后台的 `wham/usage` 和 `wham/usage/credit-usage-events`，显示计划类型、5小时/每周限额窗口、剩余 Credits，以及与 Codex Cloud Analytics 一致的近7天 Codex/Work Credits 汇总；用标准 OpenAI OAuth 登录即可，无需 API key，access token 自动刷新
+- **TokenRhythm 账户** — 当前提供商为 `tokenrhythm` 时，侧边栏显示 tokenrhythm.studio 的**实际可用总额**和**累计成本**（与账户页同源数字）；需要浏览器会话 Cookie（见下文）
 - **Provider 配额（可选）** — 连接 OpenAI/Anthropic 计费 API，显示真实费用和限额
 - **AI 可调用** — `usage_stats` 工具可让模型在收到询问时报告用量
 - **Toast 提醒** — 接近限额时弹出警告（默认阈值 80%）
@@ -91,12 +92,24 @@ Authorization: Bearer <opencode-go key>
 }
 ```
 
+### 可选：TokenRhythm 余额显示
+
+tokenrhythm.studio 的管理接口只认浏览器登录会话，`sk_tr_...` API key 无法读取钱包。要在侧边栏显示**实际可用总额 / 累计成本**，请复制会话 Cookie：
+
+1. 登录 `https://tokenrhythm.studio/account/account`
+2. 打开 DevTools → Network → 点任意 `/api/...` 请求 → Request Headers
+3. 把整个 `Cookie:` 请求头的值复制到 `~/.opencode/tokenrhythm-cookie.txt`
+
+站点会话闲置约 24 小时后过期；过期后侧边栏会显示"Cookie 已过期"提示并保留最后一次数据，更新文件即可恢复。也可以通过 `tokenrhythmCookie` 插件选项传入。
+
 ## 配置项
 
 | 选项 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `openaiApiKey` | `string` | — | 用于查询账单用量的 OpenAI API key |
 | `anthropicApiKey` | `string` | — | 用于查询用量的 Anthropic API key |
+| `chatGptAccountId` | `string` | — | 可选的 ChatGPT 工作区账号 ID；个人账号无需配置 |
+| `tokenrhythmCookie` | `string` | — | TokenRhythm 会话 Cookie（也可用 `~/.opencode/tokenrhythm-cookie.txt` 文件） |
 | `usageThresholdPercent` | `number` | `80` | Toast 警告触发的用量百分比 |
 | `language`（tui 插件） | `string` | `en` | 侧边栏语言：`en` 或 `zh` |
 

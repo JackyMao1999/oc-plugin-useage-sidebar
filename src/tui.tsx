@@ -107,6 +107,16 @@ function fmtPct(n: number): string {
   return Number.isInteger(n) ? String(n) : n.toFixed(1)
 }
 
+function fmtCredits(n: number): string {
+  return (Math.round(n * 10) / 10).toFixed(1)
+}
+
+// fmtMoney: 货币格式化 —— CNY 用 ¥ 前缀，其他币种显示在数值后面（如 "12.34 USD"）
+function fmtMoney(n: number, currency?: string): string {
+  const v = n.toFixed(2)
+  return !currency || currency === "CNY" ? `¥${v}` : `${v} ${currency}`
+}
+
 // 已提醒过的百分比（跨组件共享，状态栏组件负责检查）
 //   只在"跨越阈值"时提醒一次，避免每轮刷新都弹：
 //   1. 首次达到阈值 → 提醒
@@ -185,12 +195,25 @@ interface GoApiUsage {
 // ChatGptUsage: ChatGPT (chatgpt.com) 用量 —— 来自 backend-api/wham/usage
 //   primary   : 5 小时窗口
 //   secondary : 每周窗口
-//   credits   : 余额（美元）
+//   credits   : 剩余 Credits
 interface ChatGptUsage {
   planType?: string
   primary: GoApiWindow
-  secondary: GoApiWindow
+  secondary?: GoApiWindow
   credits?: number
+  creditUsage?: ChatGptCreditUsage
+  lastChecked?: string
+}
+
+interface CreditUsageBreakdown {
+  codex: number
+  work: number
+  total: number
+}
+
+interface ChatGptCreditUsage {
+  daily: Record<string, CreditUsageBreakdown>
+  last7Days: CreditUsageBreakdown
   lastChecked?: string
 }
 
@@ -208,6 +231,18 @@ interface ProviderUsage {
   goWindows?: GoWindows                                    // Go 的三窗口数据（只有 Go provider 会有）
   goApi?: GoApiUsage                                       // Go 官方 API 数据（percent + resetsAt）
   chatgpt?: ChatGptUsage                                   // ChatGPT 用量数据（wham/usage）
+  tokenrhythm?: TokenRhythmUsage                           // TokenRhythm 账户数据（钱包 + 用量汇总）
+}
+
+// TokenRhythmUsage: TokenRhythm（tokenrhythm.studio）账户数据
+// 来自 /api/wallet/summary 和 /api/usage-summary，与账户页"实际可用总额/总成本"同源
+interface TokenRhythmUsage {
+  availableBalance?: number  // 实际可用总额（CNY）
+  currency?: string          // 币种，默认 CNY
+  totalCost?: number         // 累计成本（已产生费用，CNY）
+  calls?: number             // 累计调用次数
+  authExpired?: boolean      // Cookie 失效（401），数据为旧值
+  lastChecked?: string
 }
 
 // DayStats: 某一天的使用统计
@@ -315,6 +350,13 @@ interface Strings {
   noActiveProvider: string
   plan: string
   balance: string
+  creditsSpent: string
+  codexCredits: string
+  workCredits: string
+  availBalance: string
+  totalCost: string
+  calls: string
+  cookieExpired: string
   threshold: string
   adjustThreshold: string
   setThresholdTitle: string
@@ -351,7 +393,14 @@ function makeStrings(lang: Lang): Strings {
         notConfigured: "未配置",
         noActiveProvider: "未检测到使用中的提供商",
         plan: "计划",
-        balance: "余额",
+        balance: "Credits余额",
+        creditsSpent: "近7天 Credits",
+        codexCredits: "Codex Credits",
+        workCredits: "Work Credits",
+        availBalance: "实际可用总额",
+        totalCost: "累计成本",
+        calls: "调用次数",
+        cookieExpired: "Cookie 已过期，请更新 tokenrhythm-cookie.txt",
         threshold: "提醒阈值",
         adjustThreshold: "调整阈值",
         setThresholdTitle: "设置用量提醒阈值 (%)",
@@ -386,7 +435,14 @@ function makeStrings(lang: Lang): Strings {
         notConfigured: "Not configured",
         noActiveProvider: "No provider in use",
         plan: "Plan",
-        balance: "Balance",
+        balance: "Credits balance",
+        creditsSpent: "Credits (7d)",
+        codexCredits: "Codex Credits",
+        workCredits: "Work Credits",
+        availBalance: "Available",
+        totalCost: "Total cost",
+        calls: "Calls",
+        cookieExpired: "Cookie expired, update tokenrhythm-cookie.txt",
         threshold: "Alert threshold",
         adjustThreshold: "Adjust threshold",
         setThresholdTitle: "Set usage alert threshold (%)",
@@ -421,6 +477,7 @@ const PROVIDER_META: ProviderMeta[] = [
   { id: "deepseek", name: "DeepSeek", color: "#4f46e5", glyph: "❖" },
   { id: "zhipuai", name: "GLM", color: "#2563eb", glyph: "❖" },
   { id: "siliconflow-cn", name: "SiliconFlow", color: "#0891b2", glyph: "❖" },
+  { id: "tokenrhythm", name: "TokenRhythm", color: "#06b6d4", glyph: "⬢" },
 ]
 
 
@@ -576,7 +633,7 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
         color: meta?.color ?? "#94a3b8",
         glyph: meta?.glyph ?? "●",
         active: true,
-        configured: Boolean(keys[id]),
+        configured: Boolean(keys[id]) || Boolean(puMap[id]?.tokenrhythm),
         pu: puMap[id],
       },
     ]
@@ -750,15 +807,38 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
         {InfoRow(t.cost, `$${pu!.cost!.toFixed(2)}`)}
       </Show>
 
-      {/* ChatGPT（wham/usage）：计划 + 5小时/每周窗口 + 余额 */}
+      {/* ChatGPT：限额窗口与 Analytics Credits 分开显示 */}
       <Show when={id === "openai" && pu?.chatgpt}>
         <Show when={pu!.chatgpt!.planType}>
           {InfoRow(t.plan, pu!.chatgpt!.planType!.charAt(0).toUpperCase() + pu!.chatgpt!.planType!.slice(1))}
         </Show>
         {GoWindowPercent(t.rolling5h, pu!.chatgpt!.primary)}
-        {GoWindowPercent(t.weekly, pu!.chatgpt!.secondary)}
+        <Show when={pu!.chatgpt!.secondary}>
+          {GoWindowPercent(t.weekly, pu!.chatgpt!.secondary!)}
+        </Show>
         <Show when={pu!.chatgpt!.credits != null}>
-          {InfoRow(t.balance, `$${pu!.chatgpt!.credits!.toFixed(2)}`)}
+          {InfoRow(t.balance, fmtCredits(pu!.chatgpt!.credits!))}
+        </Show>
+        <Show when={pu!.chatgpt!.creditUsage}>
+          {InfoRow(t.creditsSpent, fmtCredits(pu!.chatgpt!.creditUsage!.last7Days.total))}
+          {InfoRow(t.codexCredits, fmtCredits(pu!.chatgpt!.creditUsage!.last7Days.codex))}
+          {InfoRow(t.workCredits, fmtCredits(pu!.chatgpt!.creditUsage!.last7Days.work))}
+        </Show>
+      </Show>
+
+      {/* TokenRhythm：账户余额与累计成本（和 tokenrhythm.studio 账户页同源） */}
+      <Show when={id === "tokenrhythm" && pu?.tokenrhythm}>
+        <Show when={pu!.tokenrhythm!.availableBalance != null}>
+          {InfoRow(t.availBalance, fmtMoney(pu!.tokenrhythm!.availableBalance!, pu!.tokenrhythm!.currency))}
+        </Show>
+        <Show when={pu!.tokenrhythm!.totalCost != null}>
+          {InfoRow(t.totalCost, fmtMoney(pu!.tokenrhythm!.totalCost!, pu!.tokenrhythm!.currency))}
+        </Show>
+        <Show when={pu!.tokenrhythm!.calls != null}>
+          {InfoRow(t.calls, pu!.tokenrhythm!.calls!.toLocaleString())}
+        </Show>
+        <Show when={pu!.tokenrhythm!.authExpired}>
+          <text fg={theme().warning} paddingLeft={2}>{t.cookieExpired}</text>
         </Show>
       </Show>
 
@@ -887,7 +967,9 @@ async function checkAllAlerts(api: any, data: UsageData, t: Strings, threshold: 
         }
       }
     } else if (pid === "openai" && pu.chatgpt) {
-      for (const [wname, w] of Object.entries({ [t.rolling5h]: pu.chatgpt.primary, [t.weekly]: pu.chatgpt.secondary })) {
+      const windows: Record<string, GoApiWindow> = { [t.rolling5h]: pu.chatgpt.primary }
+      if (pu.chatgpt.secondary) windows[t.weekly] = pu.chatgpt.secondary
+      for (const [wname, w] of Object.entries(windows)) {
         if (crossedThreshold(`chatgpt.${wname}`, w.percent, threshold)) {
           alerts.push({ name: `${name} ${wname}`, pct: w.percent })
         }
@@ -953,7 +1035,7 @@ function UsageStatusBar(props: { api: any; sessionId?: string; lang: Lang }) {
       out.push({ name: t.monthly, pct: pu.goApi.monthly.percent })
     } else if (id === "openai" && pu?.chatgpt) {
       out.push({ name: t.rolling5h, pct: pu.chatgpt.primary.percent })
-      out.push({ name: t.weekly, pct: pu.chatgpt.secondary.percent })
+      if (pu.chatgpt.secondary) out.push({ name: t.weekly, pct: pu.chatgpt.secondary.percent })
     } else if (pu?.cost != null && pu?.limit != null && pu.limit > 0) {
       out.push({ name: t.used, pct: (pu.cost / pu.limit) * 100 })
     }
