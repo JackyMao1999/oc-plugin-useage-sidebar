@@ -10,6 +10,7 @@ AI model usage monitoring plugin for [opencode](https://opencode.ai). Tracks ses
 - **Go plan usage** — official API percent windows (rolling 5h / weekly / monthly) with reset countdown
 - **ChatGPT usage** — reads `wham/usage` and `wham/usage/credit-usage-events` from the ChatGPT backend for plan type, 5h/weekly rate-limit windows, remaining Credits, and the same 7-day Codex/Work Credits totals shown by Codex Cloud Analytics. Works with the standard OpenAI OAuth login — no API key needed; the access token is refreshed automatically
 - **TokenRhythm account** — when the active provider is `tokenrhythm`, shows the actual available balance (实际可用总额) and cumulative cost (累计成本) from tokenrhythm.studio — the same numbers as the account page. Requires a browser session cookie (see below)
+- **DeepSeek balance** — when the active provider is `deepseek`, shows total, recharged, and granted balance from the DeepSeek balance API
 - **Provider quota (optional)** — connects to OpenAI/Anthropic billing APIs for real cost and limit data
 - **AI callable** — the `usage_stats` tool lets the model report usage when asked
 - **Toast alerts** — warns at configurable threshold (default 80%) when approaching a provider limit
@@ -120,6 +121,7 @@ file. Alternatively pass the cookie via the `tokenrhythmCookie` plugin option.
 |--------|------|---------|-------------|
 | `openaiApiKey` | `string` | — | OpenAI API key for billing usage queries |
 | `anthropicApiKey` | `string` | — | Anthropic API key for usage queries |
+| `deepseekApiKey` | `string` | — | DeepSeek API key for balance queries; falls back to `auth.json` |
 | `chatGptAccountId` | `string` | — | Optional ChatGPT workspace account ID; omit for a personal account |
 | `tokenrhythmCookie` | `string` | — | TokenRhythm session cookie (alternative to `~/.opencode/tokenrhythm-cookie.txt`) |
 | `usageThresholdPercent` | `number` | `80` | Percentage at which toast warning fires |

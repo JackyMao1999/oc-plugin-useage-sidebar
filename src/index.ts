@@ -116,6 +116,7 @@ interface ProviderUsage {
   goApi?: GoApiUsage;
   chatgpt?: ChatGptUsage;
   tokenrhythm?: TokenRhythmUsage;
+  deepseek?: DeepSeekUsage;
 }
 
 // TokenRhythm（tokenrhythm.studio）账户用量 —— 来自 /api/wallet/summary 和 /api/usage-summary
@@ -126,6 +127,15 @@ interface TokenRhythmUsage {
   totalCost?: number;        // 累计成本（已产生费用，CNY）
   calls?: number;            // 累计调用次数
   authExpired?: boolean;     // Cookie 失效（401），数据为旧值
+  lastChecked?: string;
+}
+
+interface DeepSeekUsage {
+  totalBalance?: number;
+  grantedBalance?: number;
+  toppedUpBalance?: number;
+  currency?: string;
+  isAvailable?: boolean;
   lastChecked?: string;
 }
 
@@ -494,7 +504,20 @@ interface PluginOptions {
   goApiKey?: string;
   chatGptAccountId?: string;
   tokenrhythmCookie?: string;
+  deepseekApiKey?: string;
   usageThresholdPercent?: number;
+}
+
+function readProviderKey(provider: string): string | null {
+  try {
+    const authPath = join(homedir(), ".local", "share", "opencode", "auth.json");
+    if (!existsSync(authPath)) return null;
+    const auth = JSON.parse(readFileSync(authPath, "utf-8"));
+    const key = auth[provider]?.key;
+    return typeof key === "string" && key.trim() ? key.trim() : null;
+  } catch {
+    return null;
+  }
 }
 
 function loadData(filePath: string): UsageData {
@@ -614,6 +637,14 @@ function formatProviderUsage(pu: ProviderUsage, label: string): string {
     if (tr.calls != null) lines.push(`  Calls:      ${tr.calls.toLocaleString()}`);
     if (tr.authExpired) lines.push(`  Note:       session cookie expired, showing stale data`);
   }
+  if (pu.deepseek) {
+    const ds = pu.deepseek;
+    const money = (n: number) => `${n.toFixed(2)} ${ds.currency || "CNY"}`;
+    if (ds.totalBalance != null) lines.push(`  Balance:    ${money(ds.totalBalance)}`);
+    if (ds.toppedUpBalance != null) lines.push(`  Recharged:  ${money(ds.toppedUpBalance)}`);
+    if (ds.grantedBalance != null) lines.push(`  Granted:    ${money(ds.grantedBalance)}`);
+    if (ds.isAvailable === false) lines.push(`  Note:       balance unavailable for API calls`);
+  }
   if (pu.goApi) {
     const fmt = (w: GoApiWindow) =>
       `${fmtPct(w.percent)}% used${w.resetsAt ? ` (resets ${new Date(w.resetsAt).toLocaleString()})` : ""}`;
@@ -683,6 +714,36 @@ async function checkAnthropicUsage(apiKey: string): Promise<ProviderUsage | null
       cost: json.total_cost,
       limit: json.credit_limit ?? null,
       remaining: json.remaining_credits,
+      lastChecked: new Date().toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function checkDeepSeekBalance(apiKey: string): Promise<DeepSeekUsage | null> {
+  try {
+    const resp = await fetch("https://api.deepseek.com/user/balance", {
+      headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+    });
+    if (!resp.ok) return null;
+    const json: any = await resp.json();
+    const balance = Array.isArray(json?.balance_infos) ? json.balance_infos[0] : null;
+    if (!balance) return null;
+    const num = (value: unknown): number | undefined => {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    const totalBalance = num(balance.total_balance);
+    const grantedBalance = num(balance.granted_balance);
+    const toppedUpBalance = num(balance.topped_up_balance);
+    if (totalBalance == null && grantedBalance == null && toppedUpBalance == null) return null;
+    return {
+      totalBalance,
+      grantedBalance,
+      toppedUpBalance,
+      currency: typeof balance.currency === "string" ? balance.currency : "CNY",
+      isAvailable: typeof json.is_available === "boolean" ? json.is_available : undefined,
       lastChecked: new Date().toISOString(),
     };
   } catch {
@@ -782,6 +843,20 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
     };
     poll();
     setInterval(poll, CONFIG.providerCheckIntervalMs);
+  }
+
+  const deepseekKey = opts.deepseekApiKey || readProviderKey("deepseek");
+  if (deepseekKey) {
+    const pollDeepSeek = async () => {
+      const usage = await checkDeepSeekBalance(deepseekKey);
+      if (!usage) return;
+      const pu = data.providerUsage.deepseek || { lastChecked: new Date().toISOString() };
+      pu.deepseek = usage;
+      data.providerUsage.deepseek = pu;
+      markDirty();
+    };
+    pollDeepSeek();
+    setInterval(pollDeepSeek, CONFIG.providerCheckIntervalMs);
   }
 
   const trackedCosts = new Set<string>();

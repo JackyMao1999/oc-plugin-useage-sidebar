@@ -10,6 +10,7 @@
 - **Go 套餐用量** — 通过官方 API 显示 Rolling 5h / Weekly / Monthly 的已用百分比 + 重置倒计时（超过 24 小时自动显示为天）
 - **ChatGPT 用量** — 读取 ChatGPT 后台的 `wham/usage` 和 `wham/usage/credit-usage-events`，显示计划类型、5小时/每周限额窗口、剩余 Credits，以及与 Codex Cloud Analytics 一致的近7天 Codex/Work Credits 汇总；用标准 OpenAI OAuth 登录即可，无需 API key，access token 自动刷新
 - **TokenRhythm 账户** — 当前提供商为 `tokenrhythm` 时，侧边栏显示 tokenrhythm.studio 的**实际可用总额**和**累计成本**（与账户页同源数字）；需要浏览器会话 Cookie（见下文）
+- **DeepSeek 余额** — 当前提供商为 `deepseek` 时，通过 DeepSeek API key 显示总余额、充值余额和赠送余额；自动读取 OpenCode 登录保存的 key，也可手动配置
 - **Provider 配额（可选）** — 连接 OpenAI/Anthropic 计费 API，显示真实费用和限额
 - **AI 可调用** — `usage_stats` 工具可让模型在收到询问时报告用量
 - **Toast 提醒** — 接近限额时弹出警告（默认阈值 80%）
@@ -87,6 +88,7 @@ Authorization: Bearer <opencode-go key>
   "plugin": [["/path/to/oc-plugin-usage/src/index.ts", {
     "openaiApiKey": "sk-...",
     "anthropicApiKey": "sk-ant-...",
+    "deepseekApiKey": "sk-...",
     "usageThresholdPercent": 80
   }]]
 }
@@ -108,6 +110,7 @@ tokenrhythm.studio 的管理接口只认浏览器登录会话，`sk_tr_...` API 
 |------|------|--------|------|
 | `openaiApiKey` | `string` | — | 用于查询账单用量的 OpenAI API key |
 | `anthropicApiKey` | `string` | — | 用于查询用量的 Anthropic API key |
+| `deepseekApiKey` | `string` | — | 用于查询 DeepSeek 余额的 API key；未配置时自动读取 `auth.json` |
 | `chatGptAccountId` | `string` | — | 可选的 ChatGPT 工作区账号 ID；个人账号无需配置 |
 | `tokenrhythmCookie` | `string` | — | TokenRhythm 会话 Cookie（也可用 `~/.opencode/tokenrhythm-cookie.txt` 文件） |
 | `usageThresholdPercent` | `number` | `80` | Toast 警告触发的用量百分比 |

@@ -232,6 +232,7 @@ interface ProviderUsage {
   goApi?: GoApiUsage                                       // Go 官方 API 数据（percent + resetsAt）
   chatgpt?: ChatGptUsage                                   // ChatGPT 用量数据（wham/usage）
   tokenrhythm?: TokenRhythmUsage                           // TokenRhythm 账户数据（钱包 + 用量汇总）
+  deepseek?: DeepSeekUsage                                  // DeepSeek 余额数据
 }
 
 // TokenRhythmUsage: TokenRhythm（tokenrhythm.studio）账户数据
@@ -242,6 +243,15 @@ interface TokenRhythmUsage {
   totalCost?: number         // 累计成本（已产生费用，CNY）
   calls?: number             // 累计调用次数
   authExpired?: boolean      // Cookie 失效（401），数据为旧值
+  lastChecked?: string
+}
+
+interface DeepSeekUsage {
+  totalBalance?: number
+  grantedBalance?: number
+  toppedUpBalance?: number
+  currency?: string
+  isAvailable?: boolean
   lastChecked?: string
 }
 
@@ -357,6 +367,10 @@ interface Strings {
   totalCost: string
   calls: string
   cookieExpired: string
+  deepseekBalance: string
+  deepseekRecharged: string
+  deepseekGranted: string
+  deepseekUnavailable: string
   threshold: string
   adjustThreshold: string
   setThresholdTitle: string
@@ -401,6 +415,10 @@ function makeStrings(lang: Lang): Strings {
         totalCost: "累计成本",
         calls: "调用次数",
         cookieExpired: "Cookie 已过期，请更新 tokenrhythm-cookie.txt",
+        deepseekBalance: "余额",
+        deepseekRecharged: "充值余额",
+        deepseekGranted: "赠送余额",
+        deepseekUnavailable: "余额不可用于 API 调用",
         threshold: "提醒阈值",
         adjustThreshold: "调整阈值",
         setThresholdTitle: "设置用量提醒阈值 (%)",
@@ -443,6 +461,10 @@ function makeStrings(lang: Lang): Strings {
         totalCost: "Total cost",
         calls: "Calls",
         cookieExpired: "Cookie expired, update tokenrhythm-cookie.txt",
+        deepseekBalance: "Balance",
+        deepseekRecharged: "Recharged",
+        deepseekGranted: "Granted",
+        deepseekUnavailable: "Balance unavailable for API calls",
         threshold: "Alert threshold",
         adjustThreshold: "Adjust threshold",
         setThresholdTitle: "Set usage alert threshold (%)",
@@ -524,6 +546,42 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
 
   // goUpdated：最近一次成功拉取官方 API 的时间戳（用于"更新"显示）
   const [goUpdated, setGoUpdated] = createSignal<number | null>(null)
+
+  const [deepSeekUsage, setDeepSeekUsage] = createSignal<DeepSeekUsage | null>(null)
+
+  async function refreshDeepSeekBalance() {
+    try {
+      const authPath = join(homedir(), ".local", "share", "opencode", "auth.json")
+      if (!existsSync(authPath)) return
+      const auth = JSON.parse(readFileSync(authPath, "utf-8"))
+      const key = auth.deepseek?.key
+      if (typeof key !== "string" || !key) return
+      const resp = await fetch("https://api.deepseek.com/user/balance", {
+        headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
+      })
+      if (!resp.ok) return
+      const json = await resp.json() as any
+      const balance = Array.isArray(json?.balance_infos) ? json.balance_infos[0] : null
+      if (!balance) return
+      const numberOrUndefined = (value: unknown) => {
+        const n = Number(value)
+        return Number.isFinite(n) ? n : undefined
+      }
+      setDeepSeekUsage({
+        totalBalance: numberOrUndefined(balance.total_balance),
+        grantedBalance: numberOrUndefined(balance.granted_balance),
+        toppedUpBalance: numberOrUndefined(balance.topped_up_balance),
+        currency: typeof balance.currency === "string" ? balance.currency : "CNY",
+        isAvailable: typeof json.is_available === "boolean" ? json.is_available : undefined,
+        lastChecked: new Date().toISOString(),
+      })
+    } catch {
+      // 网络错误或 key 无效时回退到数据文件里的缓存
+    }
+  }
+  refreshDeepSeekBalance()
+  const deepSeekTimer = setInterval(refreshDeepSeekBalance, 60000)
+  onCleanup(() => clearInterval(deepSeekTimer))
 
   // threshold：用量提醒阈值（%），从配置文件读取；每 30 秒随数据一起刷新
   const [threshold, setThreshold] = createSignal(readThresholdFile())
@@ -788,7 +846,10 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
 
   // ProviderDetails: 某个 provider 的用量明细
   //   Go：官方 API 三窗口进度条；其他：费用/剩余/Token 数
-  const ProviderDetails = (id: string, pu?: ProviderUsage) => (
+  const ProviderDetails = (id: string, pu?: ProviderUsage) => {
+    // DeepSeek：优先用 TUI 实时拉取的余额，其次用数据文件里的缓存
+    const ds = id === "deepseek" ? (deepSeekUsage() ?? pu?.deepseek) : undefined
+    return (
     <box paddingLeft={2}>
       <Show when={id === "opencode-go" && goUsage()}>
         {InfoRow(t.plan, "Go")}
@@ -842,6 +903,21 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
         </Show>
       </Show>
 
+      <Show when={id === "deepseek" && ds}>
+        <Show when={ds!.totalBalance != null}>
+          {InfoRow(t.deepseekBalance, fmtMoney(ds!.totalBalance!, ds!.currency))}
+        </Show>
+        <Show when={ds!.toppedUpBalance != null}>
+          {InfoRow(t.deepseekRecharged, fmtMoney(ds!.toppedUpBalance!, ds!.currency))}
+        </Show>
+        <Show when={ds!.grantedBalance != null}>
+          {InfoRow(t.deepseekGranted, fmtMoney(ds!.grantedBalance!, ds!.currency))}
+        </Show>
+        <Show when={ds!.isAvailable === false}>
+          <text fg={theme().warning} paddingLeft={2}>{t.deepseekUnavailable}</text>
+        </Show>
+      </Show>
+
       <Show when={id !== "opencode-go" && pu?.limit != null && pu!.limit! > 0 && pu?.cost != null}>
         {BarRow(t.used, (pu!.cost! / pu!.limit!) * 100, pctColor((pu!.cost! / pu!.limit!) * 100))}
       </Show>
@@ -854,7 +930,8 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
         {InfoRow(t.tokens, pu!.totalTokens!.toLocaleString())}
       </Show>
     </box>
-  )
+    )
+  }
 
   // -------- 以下是主渲染结构（JSX，看起来像 HTML） --------
   // 从 <box> 开始一直到 </box>，就是整个侧边栏面板的 UI
@@ -913,8 +990,8 @@ return (
                       {p.active ? t.inUse : p.configured ? t.configured : t.notConfigured}
                     </text>
                   </box>
-                  {/* 当前使用的提供商显示明细 */}
-                  <Show when={p.pu || (p.id === "opencode-go" && goUsage())}>
+                  {/* 当前使用的提供商显示明细（Go 有实时 API，DeepSeek 有实时余额，其余看数据文件） */}
+                  <Show when={p.pu || (p.id === "opencode-go" && goUsage()) || (p.id === "deepseek" && deepSeekUsage())}>
                     {ProviderDetails(p.id, p.pu)}
                   </Show>
                 </box>
