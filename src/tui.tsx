@@ -192,6 +192,13 @@ interface GoApiUsage {
   lastChecked?: string
 }
 
+interface ResponseMetrics {
+  responses: number
+  ttftMsTotal: number
+  outputTokens: number
+  generationMsTotal: number
+}
+
 // ChatGptUsage: ChatGPT (chatgpt.com) 用量 —— 来自 backend-api/wham/usage
 //   primary   : 5 小时窗口
 //   secondary : 每周窗口
@@ -233,6 +240,7 @@ interface ProviderUsage {
   chatgpt?: ChatGptUsage                                   // ChatGPT 用量数据（wham/usage）
   tokenrhythm?: TokenRhythmUsage                           // TokenRhythm 账户数据（钱包 + 用量汇总）
   deepseek?: DeepSeekUsage                                  // DeepSeek 余额数据
+  responseMetrics?: ResponseMetrics                          // 首字延迟和输出速度
 }
 
 // TokenRhythmUsage: TokenRhythm（tokenrhythm.studio）账户数据
@@ -340,8 +348,13 @@ interface Strings {
   sessionCache: string
   hitRate: string
   input: string
+  output: string
   read: string
   write: string
+  ttft: string
+  tokensPerSecond: string
+  avgTtft: string
+  avgTokensPerSecond: string
   noTurns: string
   providers: string
   noneConfigured: string
@@ -388,8 +401,13 @@ function makeStrings(lang: Lang): Strings {
         sessionCache: "会话缓存",
         hitRate: "命中率",
         input: "输入",
+        output: "输出",
         read: "缓存读取",
         write: "缓存写入",
+        ttft: "首字延迟",
+        tokensPerSecond: "输出速度",
+        avgTtft: "平均首字",
+        avgTokensPerSecond: "平均速度",
         noTurns: "暂无助手回复",
         providers: "提供商",
         noneConfigured: "未配置",
@@ -434,8 +452,13 @@ function makeStrings(lang: Lang): Strings {
         sessionCache: "Session Cache",
         hitRate: "Hit rate",
         input: "Input",
+        output: "Output",
         read: "Read",
         write: "Write",
+        ttft: "TTFT",
+        tokensPerSecond: "Tokens/s",
+        avgTtft: "Avg TTFT",
+        avgTokensPerSecond: "Avg TPS",
         noTurns: "No assistant turns yet",
         providers: "Providers",
         noneConfigured: "None configured",
@@ -733,6 +756,56 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
     return stats
   })
 
+  // 当前会话的响应速度：首字延迟从助手消息创建到首个文本分片，
+  // 输出速度按输出 token /（首字到完成的时间）计算。
+  const responseStats = createMemo(() => {
+    const stats = { turns: 0, ttftMs: 0, outputTokens: 0, generationMs: 0 }
+    if (!props.api.state?.ready || !props.sessionId) return stats
+    const timestamp = (value: unknown): number | undefined => {
+      const n = Number(value)
+      return Number.isFinite(n) && n >= 0 ? n : undefined
+    }
+    try {
+      const msgs = props.api.state.session.messages(props.sessionId)
+      for (const raw of msgs) {
+        const msg = raw as any
+        if (msg.role !== "assistant") continue
+        const createdAt = timestamp(msg.time?.created)
+        if (createdAt == null) continue
+        const parts = props.api.state.part(msg.id) ?? []
+        const textParts = parts.filter((part: any) =>
+          part.type === "text" && !part.synthetic && !part.ignored && typeof part.text === "string" && part.text.length > 0,
+        )
+        const starts = textParts
+          .map((part: any) => timestamp(part.time?.start))
+          .filter((value: number | undefined): value is number => value != null)
+        if (starts.length === 0) continue
+        const firstTokenAt = Math.min(...starts)
+        const ttftMs = firstTokenAt - createdAt
+        if (!Number.isFinite(ttftMs) || ttftMs < 0) continue
+
+        const completedAt = timestamp(msg.time?.completed)
+        const ends = textParts
+          .map((part: any) => timestamp(part.time?.end))
+          .filter((value: number | undefined): value is number => value != null)
+        const endAt = completedAt ?? (ends.length > 0 ? Math.max(...ends) : Date.now())
+        const generationMs = endAt - firstTokenAt
+        if (!Number.isFinite(generationMs) || generationMs < 0) continue
+
+        stats.turns++
+        stats.ttftMs += ttftMs
+        const outputTokens = Number(msg.tokens?.output)
+        if (Number.isFinite(outputTokens) && outputTokens > 0 && generationMs > 0) {
+          stats.outputTokens += outputTokens
+          stats.generationMs += generationMs
+        }
+      }
+    } catch {
+      // 会话尚未加载完时可能抛错，保留当前已计算的值
+    }
+    return stats
+  })
+
   // -------- UI 辅助函数 --------
   // 这些小函数返回 JSX 元素（HTML 标签），用来避免重复写相同的代码
 
@@ -814,6 +887,12 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
     if (n >= 1e3) return (n / 1e3).toFixed(1) + "k"
     return String(n)
   }
+
+  const fmtDurationMs = (ms: number) =>
+    ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`
+
+  const fmtTokensPerSecond = (tokensPerSecond: number) =>
+    `${tokensPerSecond >= 100 ? tokensPerSecond.toFixed(0) : tokensPerSecond.toFixed(1)} tokens/s`
 
   // resetIn: 计算距离重置时间的倒计时（精确到分钟）
   //   例：resetIn("2026-07-18T12:00:00Z") → "3h 42m"、"45m" 或 "4d 12h"（超过 24 小时显示天 + 小时）
@@ -929,6 +1008,16 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
       <Show when={pu?.totalTokens != null}>
         {InfoRow(t.tokens, pu!.totalTokens!.toLocaleString())}
       </Show>
+
+      <Show when={pu?.responseMetrics?.responses}>
+        {InfoRow(t.avgTtft, fmtDurationMs(pu!.responseMetrics!.ttftMsTotal / pu!.responseMetrics!.responses))}
+        <Show when={pu!.responseMetrics!.outputTokens > 0 && pu!.responseMetrics!.generationMsTotal > 0}>
+          {InfoRow(
+            t.avgTokensPerSecond,
+            fmtTokensPerSecond(pu!.responseMetrics!.outputTokens / (pu!.responseMetrics!.generationMsTotal / 1000)),
+          )}
+        </Show>
+      </Show>
     </box>
     )
   }
@@ -954,8 +1043,18 @@ return (
             <box paddingLeft={2}>
               {BarRow(t.hitRate, cacheStats().hit, cacheColor(cacheStats().hit))}
               {InfoRow(t.input, fmtTokens(cacheStats().input))}
+              {InfoRow(t.output, fmtTokens(cacheStats().output))}
               {InfoRow(t.read, fmtTokens(cacheStats().read))}
               {InfoRow(t.write, fmtTokens(cacheStats().write))}
+              <Show when={responseStats().turns > 0}>
+                {InfoRow(t.ttft, fmtDurationMs(responseStats().ttftMs / responseStats().turns))}
+              </Show>
+              <Show when={responseStats().outputTokens > 0 && responseStats().generationMs > 0}>
+                {InfoRow(
+                  t.tokensPerSecond,
+                  fmtTokensPerSecond(responseStats().outputTokens / (responseStats().generationMs / 1000)),
+                )}
+              </Show>
             </box>
           </Show>
           {/* 上面的命中率经 BarRow 用 fmtPct 格式化：整数不带 .0 */}

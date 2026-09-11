@@ -104,6 +104,21 @@ interface GoApiUsage {
   lastChecked?: string;
 }
 
+interface ResponseMetrics {
+  responses: number;
+  ttftMsTotal: number;
+  outputTokens: number;
+  generationMsTotal: number;
+}
+
+interface ResponseState {
+  providerID?: string;
+  createdAt?: number;
+  firstTokenAt?: number;
+  completedAt?: number;
+  outputTokens: number;
+}
+
 interface ProviderUsage {
   cost?: number;
   limit?: number | null;
@@ -117,6 +132,7 @@ interface ProviderUsage {
   chatgpt?: ChatGptUsage;
   tokenrhythm?: TokenRhythmUsage;
   deepseek?: DeepSeekUsage;
+  responseMetrics?: ResponseMetrics;
 }
 
 // TokenRhythm（tokenrhythm.studio）账户用量 —— 来自 /api/wallet/summary 和 /api/usage-summary
@@ -612,6 +628,10 @@ function formatStats(stats: ReturnType<typeof aggregate>, period: string): strin
   ].join("\n");
 }
 
+function formatDurationMs(ms: number): string {
+  return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
+}
+
 function formatProviderUsage(pu: ProviderUsage, label: string): string {
   const lines: string[] = [`--- ${label} ---`];
   const fmtPct = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(1));
@@ -665,6 +685,15 @@ function formatProviderUsage(pu: ProviderUsage, label: string): string {
     if (pu.limit != null && pu.cost != null && pu.limit > 0) {
       const pct = ((pu.cost / pu.limit) * 100).toFixed(1);
       lines.push(`  Used:       ${pct}%`);
+    }
+  }
+  if (pu.responseMetrics?.responses) {
+    const metrics = pu.responseMetrics;
+    const avgTtft = metrics.ttftMsTotal / metrics.responses;
+    lines.push(`  Avg TTFT:   ${formatDurationMs(avgTtft)}`);
+    if (metrics.outputTokens > 0 && metrics.generationMsTotal > 0) {
+      const tokensPerSecond = metrics.outputTokens / (metrics.generationMsTotal / 1000);
+      lines.push(`  Avg TPS:     ${tokensPerSecond.toFixed(1)} tokens/s`);
     }
   }
   return lines.join("\n");
@@ -832,7 +861,7 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
     const poll = async () => {
       const pu = await checkAnthropicUsage(opts.anthropicApiKey!);
       if (!pu) return;
-      data.providerUsage.anthropic = pu;
+      data.providerUsage.anthropic = { ...data.providerUsage.anthropic, ...pu };
       markDirty();
       if (pu.limit != null && pu.cost != null && pu.limit > 0) {
         const pct = (pu.cost / pu.limit) * 100;
@@ -860,6 +889,79 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
   }
 
   const trackedCosts = new Set<string>();
+  const responseStates = new Map<string, ResponseState>();
+  const trackedResponses = new Set<string>();
+
+  const finiteTimestamp = (value: unknown): number | undefined => {
+    const n = Number(value);
+    return Number.isFinite(n) && n >= 0 ? n : undefined;
+  };
+
+  const ensureResponseState = (messageID: string) => {
+    const existing = responseStates.get(messageID);
+    if (existing) return existing;
+    const state: ResponseState = { outputTokens: 0 };
+    responseStates.set(messageID, state);
+    return state;
+  };
+
+  const recordResponseMetrics = (messageID: string) => {
+    if (trackedResponses.has(messageID)) return;
+    const state = responseStates.get(messageID);
+    if (!state || !state.providerID || state.createdAt == null || state.firstTokenAt == null || state.completedAt == null) return;
+
+    const ttftMs = state.firstTokenAt - state.createdAt;
+    const generationMs = state.completedAt - state.firstTokenAt;
+    if (!Number.isFinite(ttftMs) || ttftMs < 0 || !Number.isFinite(generationMs) || generationMs <= 0) return;
+
+    const pu = data.providerUsage[state.providerID] || { lastChecked: new Date().toISOString() };
+    const metrics = pu.responseMetrics || (pu.responseMetrics = {
+      responses: 0,
+      ttftMsTotal: 0,
+      outputTokens: 0,
+      generationMsTotal: 0,
+    });
+    metrics.responses += 1;
+    metrics.ttftMsTotal += ttftMs;
+    if (state.outputTokens > 0) {
+      metrics.outputTokens += state.outputTokens;
+      metrics.generationMsTotal += generationMs;
+    }
+    pu.lastChecked = new Date().toISOString();
+    data.providerUsage[state.providerID] = pu;
+    trackedResponses.add(messageID);
+    responseStates.delete(messageID);
+    markDirty();
+  };
+
+  const updateResponseMessage = (msg: any) => {
+    if (msg?.role !== "assistant" || typeof msg.id !== "string") return;
+    if (trackedResponses.has(msg.id)) return;
+    const state = ensureResponseState(msg.id);
+    if (typeof msg.providerID === "string" && msg.providerID) state.providerID = msg.providerID;
+    const createdAt = finiteTimestamp(msg.time?.created);
+    if (createdAt != null) state.createdAt = createdAt;
+    const completedAt = finiteTimestamp(msg.time?.completed);
+    if (completedAt != null) state.completedAt = completedAt;
+    const outputTokens = Number(msg.tokens?.output);
+    if (Number.isFinite(outputTokens) && outputTokens >= 0) {
+      state.outputTokens = Math.max(state.outputTokens, outputTokens);
+    }
+    recordResponseMetrics(msg.id);
+  };
+
+  const recordFirstResponseToken = (part: any, delta?: unknown) => {
+    if (part?.type !== "text" || part.synthetic || part.ignored || typeof part.messageID !== "string") return;
+    if (trackedResponses.has(part.messageID)) return;
+    const hasText = typeof part.text === "string" && part.text.length > 0;
+    const hasDelta = typeof delta === "string" && delta.length > 0;
+    if (!hasText && !hasDelta) return;
+    const state = ensureResponseState(part.messageID);
+    if (state.firstTokenAt == null) {
+      state.firstTokenAt = finiteTimestamp(part.time?.start) ?? Date.now();
+    }
+    recordResponseMetrics(part.messageID);
+  };
 
   if (!data.providerUsage["opencode-go"]?.goWindows) {
     const goKey = opts.goApiKey || readGoKeyFromAuth();
@@ -929,6 +1031,7 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
 
   const cleanupInterval = setInterval(() => {
     if (trackedCosts.size > 10000) trackedCosts.clear();
+    if (trackedResponses.size > 10000) trackedResponses.clear();
     const go = data.providerUsage["opencode-go"];
     if (go?.recentEvents && go.recentEvents.length > 100) {
       const sixHours = 6 * 60 * 60 * 1000;
@@ -977,6 +1080,7 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
           break;
         case "message.updated": {
           const msg = (event as any).properties.info;
+          updateResponseMessage(msg);
           if (msg?.role === "assistant" && typeof msg.cost === "number" && msg.cost > 0 && !trackedCosts.has(msg.id)) {
             trackedCosts.add(msg.id);
             const pid = msg.providerID || "unknown";
@@ -1021,6 +1125,11 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
           }
           break;
         }
+        case "message.part.updated": {
+          const properties = (event as any).properties;
+          recordFirstResponseToken(properties?.part, properties?.delta);
+          break;
+        }
       }
     },
     "tool.execute.after": async (input: { tool?: string }) => {
@@ -1033,7 +1142,7 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
       usage_stats: tool({
         description:
           "Get AI model usage statistics including session counts, tool usage, file edits, " +
-          "and provider API costs. Call this when the user asks about usage, consumption, tokens, costs, or quotas.",
+          "response latency, output speed, and provider API costs. Call this when the user asks about usage, consumption, tokens, costs, or quotas.",
         args: {
           period: tool.schema
             .enum(["today", "week", "month", "rolling", "all"])
