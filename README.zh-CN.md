@@ -7,7 +7,7 @@
 ## 功能
 
 - **会话缓存命中率** — 实时统计当前会话的 `cache read / (input + read)`，显示 Hit rate、Input、Read、Write
-- **响应速度** — 统计首字延迟（TTFT）和输出速度（Tokens/s）；侧边栏显示当前会话平均值，Provider 明细和 `usage_stats` 显示持久化累计值
+- **响应速度** — 统计首字延迟（TTFT）和输出速度（Tokens/s）；侧边栏显示当前会话平均值，`usage_stats` 显示持久化累计值
 - **Go 套餐用量** — 通过官方 API 显示 Rolling 5h / Weekly / Monthly 的已用百分比 + 重置倒计时（超过 24 小时自动显示为天）
 - **ChatGPT 用量** — 读取 ChatGPT 后台的 `wham/usage` 和 `wham/usage/credit-usage-events`，显示计划类型、5小时/每周限额窗口、剩余 Credits，以及与 Codex Cloud Analytics 一致的近7天 Codex/Work Credits 汇总；用标准 OpenAI OAuth 登录即可，无需 API key，access token 自动刷新
 - **TokenRhythm 账户** — 当前提供商为 `tokenrhythm` 时，侧边栏显示 tokenrhythm.studio 的**实际可用总额**和**累计成本**（与账户页同源数字）；需要浏览器会话 Cookie（见下文）

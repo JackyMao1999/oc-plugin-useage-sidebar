@@ -7,7 +7,7 @@ AI model usage monitoring plugin for [opencode](https://opencode.ai). Tracks ses
 ## Features
 
 - **Session cache hit rate** — live `cache read / (input + read)` for the current session (Hit rate, Input, Read, Write)
-- **Response speed** — tracks time to first token (TTFT) and output throughput (Tokens/s); the sidebar shows current-session averages, while provider details and `usage_stats` show persisted totals
+- **Response speed** — tracks time to first token (TTFT) and output throughput (Tokens/s); the sidebar shows current-session averages, while `usage_stats` shows persisted totals
 - **Go plan usage** — official API percent windows (rolling 5h / weekly / monthly) with reset countdown
 - **ChatGPT usage** — reads `wham/usage` and `wham/usage/credit-usage-events` from the ChatGPT backend for plan type, 5h/weekly rate-limit windows, remaining Credits, and the same 7-day Codex/Work Credits totals shown by Codex Cloud Analytics. Works with the standard OpenAI OAuth login — no API key needed; the access token is refreshed automatically
 - **TokenRhythm account** — when the active provider is `tokenrhythm`, shows the actual available balance (实际可用总额) and cumulative cost (累计成本) from tokenrhythm.studio — the same numbers as the account page. Requires a browser session cookie (see below)

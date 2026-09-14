@@ -192,13 +192,6 @@ interface GoApiUsage {
   lastChecked?: string
 }
 
-interface ResponseMetrics {
-  responses: number
-  ttftMsTotal: number
-  outputTokens: number
-  generationMsTotal: number
-}
-
 // ChatGptUsage: ChatGPT (chatgpt.com) 用量 —— 来自 backend-api/wham/usage
 //   primary   : 5 小时窗口
 //   secondary : 每周窗口
@@ -240,7 +233,6 @@ interface ProviderUsage {
   chatgpt?: ChatGptUsage                                   // ChatGPT 用量数据（wham/usage）
   tokenrhythm?: TokenRhythmUsage                           // TokenRhythm 账户数据（钱包 + 用量汇总）
   deepseek?: DeepSeekUsage                                  // DeepSeek 余额数据
-  responseMetrics?: ResponseMetrics                          // 首字延迟和输出速度
 }
 
 // TokenRhythmUsage: TokenRhythm（tokenrhythm.studio）账户数据
@@ -353,8 +345,6 @@ interface Strings {
   write: string
   ttft: string
   tokensPerSecond: string
-  avgTtft: string
-  avgTokensPerSecond: string
   noTurns: string
   providers: string
   noneConfigured: string
@@ -406,8 +396,6 @@ function makeStrings(lang: Lang): Strings {
         write: "缓存写入",
         ttft: "首字延迟",
         tokensPerSecond: "输出速度",
-        avgTtft: "平均首字",
-        avgTokensPerSecond: "平均速度",
         noTurns: "暂无助手回复",
         providers: "提供商",
         noneConfigured: "未配置",
@@ -457,8 +445,6 @@ function makeStrings(lang: Lang): Strings {
         write: "Write",
         ttft: "TTFT",
         tokensPerSecond: "Tokens/s",
-        avgTtft: "Avg TTFT",
-        avgTokensPerSecond: "Avg TPS",
         noTurns: "No assistant turns yet",
         providers: "Providers",
         noneConfigured: "None configured",
@@ -1009,15 +995,6 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
         {InfoRow(t.tokens, pu!.totalTokens!.toLocaleString())}
       </Show>
 
-      <Show when={pu?.responseMetrics?.responses}>
-        {InfoRow(t.avgTtft, fmtDurationMs(pu!.responseMetrics!.ttftMsTotal / pu!.responseMetrics!.responses))}
-        <Show when={pu!.responseMetrics!.outputTokens > 0 && pu!.responseMetrics!.generationMsTotal > 0}>
-          {InfoRow(
-            t.avgTokensPerSecond,
-            fmtTokensPerSecond(pu!.responseMetrics!.outputTokens / (pu!.responseMetrics!.generationMsTotal / 1000)),
-          )}
-        </Show>
-      </Show>
     </box>
     )
   }
