@@ -253,6 +253,7 @@ interface TokenRhythmUsage {
   totalCost?: number         // 累计成本（已产生费用，CNY）
   calls?: number             // 累计调用次数
   authExpired?: boolean      // Cookie 失效（401），数据为旧值
+  notConfigured?: boolean    // 还没配置 Cookie，读不到任何数据
   lastChecked?: string
 }
 
@@ -302,20 +303,28 @@ interface UsageData {
 
 /**
  * 从 JSON 文件加载数据
- * 如果文件不存在或内容损坏，返回一个空的默认数据
+ * 文件损坏或暂时读不到（正被写入）时，回退到上一次成功读取的内容，
+ * 避免侧边栏瞬间清零。
  */
+let lastGoodData: UsageData | null = null
+
 function loadData(): UsageData {
   try {
     if (existsSync(DATA_FILE)) {
       // existsSync 检查文件存不存在
       // readFileSync 读取文件内容（UTF-8 编码）
       // JSON.parse 把 JSON 字符串转成 JavaScript 对象
-      return JSON.parse(readFileSync(DATA_FILE, "utf-8"))
+      const parsed = JSON.parse(readFileSync(DATA_FILE, "utf-8"))
+      if (parsed && typeof parsed === "object") {
+        lastGoodData = parsed
+        return parsed
+      }
     }
   } catch {
-    // 如果文件损坏（JSON 格式错误），catch 住异常，继续往下执行
+    // 文件损坏或读到写了一半的内容 → 用上一次成功的数据
   }
-  // 文件不存在或损坏 → 返回一个"空"的默认数据
+  if (lastGoodData) return lastGoodData
+  // 从来没有读到过有效数据 → 返回一个"空"的默认数据
   return {
     lastUpdated: new Date().toISOString(),
     startDate: "",
@@ -382,6 +391,7 @@ interface Strings {
   totalCost: string
   calls: string
   cookieExpired: string
+  cookieNotSet: string
   deepseekBalance: string
   deepseekRecharged: string
   deepseekGranted: string
@@ -435,6 +445,7 @@ function makeStrings(lang: Lang): Strings {
         totalCost: "累计成本",
         calls: "调用次数",
         cookieExpired: "Cookie 已过期，请更新 tokenrhythm-cookie.txt",
+        cookieNotSet: "未配置 Cookie，无法读取余额（见 README）",
         deepseekBalance: "余额",
         deepseekRecharged: "充值余额",
         deepseekGranted: "赠送余额",
@@ -486,6 +497,7 @@ function makeStrings(lang: Lang): Strings {
         totalCost: "Total cost",
         calls: "Calls",
         cookieExpired: "Cookie expired, update tokenrhythm-cookie.txt",
+        cookieNotSet: "Cookie not set, balance unavailable (see README)",
         deepseekBalance: "Balance",
         deepseekRecharged: "Recharged",
         deepseekGranted: "Granted",
@@ -956,6 +968,9 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
         </Show>
         <Show when={pu!.tokenrhythm!.authExpired}>
           <text fg={theme().warning} paddingLeft={2}>{t.cookieExpired}</text>
+        </Show>
+        <Show when={pu!.tokenrhythm!.notConfigured}>
+          <text fg={theme().textMuted} paddingLeft={2}>{t.cookieNotSet}</text>
         </Show>
       </Show>
 

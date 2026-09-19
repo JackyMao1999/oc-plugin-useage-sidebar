@@ -1,5 +1,5 @@
 import { Plugin } from "@opencode/plugin";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from "fs";
 import { join, dirname } from "path";
 import { homedir } from "os";
 
@@ -107,13 +107,18 @@ interface ProviderUsage {
 }
 
 // TokenRhythm（tokenrhythm.studio）账户用量 —— 来自 /api/wallet/summary 和 /api/usage-summary
-// 与账户页（/account/account）的"实际可用总额"和"总成本（已产生费用）"同源
+// 与账户页（/account/account）的"实际可用总额"和"总成本（已产生费用）"同源。
+// 这两个接口就是账户页自己调的（站点前端 runtime-config 里 apiBaseUrl="/api"）：
+//   实际可用总额 ← /wallet/summary 的 availableBalanceCny
+//   累计成本     ← /usage-summary 的 costCny
+//   调用次数     ← /usage-summary 的 calls（成功 successCalls / 错误 errorCalls）
 interface TokenRhythmUsage {
   availableBalance?: number; // 实际可用总额（CNY）
   currency?: string;         // 币种，默认 CNY
   totalCost?: number;        // 累计成本（已产生费用，CNY）
   calls?: number;            // 累计调用次数
   authExpired?: boolean;     // Cookie 失效（401），数据为旧值
+  notConfigured?: boolean;   // 还没配置 Cookie，读不到任何数据
   lastChecked?: string;
 }
 
@@ -483,11 +488,94 @@ function loadData(filePath: string): UsageData {
   };
 }
 
+// ============================================================================
+// 数据文件写入
+// ----------------------------------------------------------------------------
+// 同一个 JSON 文件可能同时被多个插件实例写入：多个 opencode 客户端各自加载
+// 一份插件、插件热重载后的旧实例、以及 setup 中途失败留下的实例。直接整体覆盖
+// 会让另一份数据里的字段"时不时消失"（实测：openai.chatgpt、deepseek.cost、
+// tokenrhythm 会来回闪），所以写盘前先读回磁盘内容做并集合并，只增不减。
+// ============================================================================
+
+function isPlainObject(value: unknown): value is Record<string, any> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function mergeArrays(disk: any[], ours: any[]): any[] {
+  const keyOf = (item: any) => JSON.stringify(isPlainObject(item) && "time" in item ? item.time : item);
+  const seen = new Set<string>();
+  const out: any[] = [];
+  for (const item of [...disk, ...ours]) {
+    const key = keyOf(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  if (out.length > 0 && out.every((item) => isPlainObject(item) && typeof item.time === "number")) {
+    out.sort((a, b) => a.time - b.time);
+  }
+  return out;
+}
+
+/**
+ * 合并磁盘上的值与内存中的值。
+ * - 两边都是数字（累计值 cost/tokens/responseMetrics）：取较大值，避免旧实例
+ *   把已经累计上去的数字改小（两个实例吃的是同一份事件流，正常情况下相等）
+ * - 两边都是带 lastChecked 的对象（余额/限额快照）：取 lastChecked 较新的那份，
+ *   这样余额下降也能正确体现，不会被旧的更大余额覆盖
+ * - 数组（recentEvents 等）：按 time 去重合并
+ * - 其它对象：递归合并
+ * - 其余情况：保留磁盘上的值（宁可不改，也不要丢数据）
+ */
+export function mergeValue(disk: any, ours: any): any {
+  if (disk === undefined || disk === null) return ours;
+  if (ours === undefined || ours === null) return disk;
+  if (typeof disk === "number" && typeof ours === "number") return Math.max(disk, ours);
+  if (Array.isArray(disk) && Array.isArray(ours)) return mergeArrays(disk, ours);
+  if (isPlainObject(disk) && isPlainObject(ours)) {
+    const diskAt = typeof disk.lastChecked === "string" ? Date.parse(disk.lastChecked) : NaN;
+    const ourAt = typeof ours.lastChecked === "string" ? Date.parse(ours.lastChecked) : NaN;
+    if (Number.isFinite(diskAt) && Number.isFinite(ourAt) && diskAt !== ourAt) {
+      return diskAt > ourAt ? disk : ours;
+    }
+    const out: Record<string, any> = { ...disk };
+    for (const [key, value] of Object.entries(ours)) out[key] = mergeValue(disk[key], value);
+    return out;
+  }
+  return disk;
+}
+
+export function mergeUsageData(disk: UsageData | null, ours: UsageData): UsageData {
+  if (!disk || typeof disk !== "object" || !isPlainObject(disk)) return ours;
+  const startDate = disk.startDate && ours.startDate && disk.startDate < ours.startDate ? disk.startDate : ours.startDate;
+  return {
+    lastUpdated: ours.lastUpdated,
+    startDate,
+    totals: mergeValue(disk.totals, ours.totals),
+    byDate: mergeValue(disk.byDate, ours.byDate),
+    providerUsage: mergeValue(disk.providerUsage, ours.providerUsage),
+    processedSessions: mergeValue(disk.processedSessions, ours.processedSessions),
+  };
+}
+
 function saveData(filePath: string, data: UsageData): void {
   const dirPath = dirname(filePath);
   if (!existsSync(dirPath)) mkdirSync(dirPath, { recursive: true });
   data.lastUpdated = new Date().toISOString();
-  writeFileSync(filePath, JSON.stringify(data, null, 2));
+
+  let merged: UsageData = data;
+  try {
+    if (existsSync(filePath)) {
+      merged = mergeUsageData(JSON.parse(readFileSync(filePath, "utf-8")) as UsageData, data);
+    }
+  } catch {
+    // 磁盘内容损坏时直接写我们的
+  }
+
+  // 原子写：先写临时文件再 rename，避免 TUI 读到写了一半的 JSON（会瞬间清零）
+  const tmpPath = `${filePath}.${process.pid}.tmp`;
+  writeFileSync(tmpPath, JSON.stringify(merged, null, 2));
+  renameSync(tmpPath, filePath);
 }
 
 function ensureTodayStats(data: UsageData): DayStats {
@@ -600,6 +688,7 @@ function formatProviderUsage(pu: ProviderUsage, label: string): string {
     if (tr.totalCost != null) lines.push(`  Total cost: ${money(tr.totalCost, tr.currency)}`);
     if (tr.calls != null) lines.push(`  Calls:      ${tr.calls.toLocaleString()}`);
     if (tr.authExpired) lines.push(`  Note:       session cookie expired, showing stale data`);
+    if (tr.notConfigured) lines.push(`  Note:       session cookie not configured`);
   }
   if (pu.deepseek) {
     const ds = pu.deepseek;
@@ -732,9 +821,18 @@ const UsagePlugin = Plugin.define({
   const data = loadData(dataFile);
   let unsaved = false;
 
+  // ready：setup 完整跑完之前，所有定时器都不干活。
+  // 如果 setup 中途抛错（例如插件被改坏后热重载），opencode 拿不到 cleanup 函数，
+  // 这些定时器就会变成"孤儿写入者"，一直用半初始化时的旧快照覆盖数据文件，
+  // 表现就是别人的数据字段"时不时消失"。用 ready 兜住这一点。
+  let ready = false;
+
   const intervals: ReturnType<typeof setInterval>[] = [];
   const addInterval = (callback: () => void, delay: number) => {
-    const timer = setInterval(callback, delay);
+    const timer = setInterval(() => {
+      if (!ready) return;
+      callback();
+    }, delay);
     intervals.push(timer);
     return timer;
   };
@@ -870,24 +968,29 @@ const UsagePlugin = Plugin.define({
   void pollChatGpt();
   addInterval(() => { void pollChatGpt(); }, CONFIG.providerCheckIntervalMs);
 
-  // TokenRhythm 账户数据轮询（需要浏览器会话 Cookie，未配置时跳过）
-  const tokenRhythmCookie = readTokenRhythmCookie(opts);
-  if (tokenRhythmCookie) {
-    const pollTokenRhythm = async () => {
-      // Cookie 文件可能被用户随时更新，每轮重新读取
-      const cookie = readTokenRhythmCookie(opts);
-      if (!cookie) return;
-      const usage = await checkTokenRhythmUsage(cookie);
-      if (!usage) return;
-      // 合并写入，保留 message 事件累计的 cost 等字段
-      const pu = data.providerUsage["tokenrhythm"] || { lastChecked: new Date().toISOString() };
-      pu.tokenrhythm = usage;
-      data.providerUsage["tokenrhythm"] = pu;
-      markDirty();
-    };
-    void pollTokenRhythm();
-    addInterval(() => { void pollTokenRhythm(); }, CONFIG.providerCheckIntervalMs);
-  }
+  // TokenRhythm 账户数据轮询（需要浏览器会话 Cookie）。
+  // 无条件注册：Cookie 文件可能稍后才创建，每轮重新读取，不必重启插件。
+  const pollTokenRhythm = async () => {
+    const cookie = readTokenRhythmCookie(opts);
+    const pu = data.providerUsage["tokenrhythm"] || { lastChecked: new Date().toISOString() };
+    if (!cookie) {
+      // 还没配置 Cookie：记一条状态，侧边栏据此提示怎么配置
+      if (!pu.tokenrhythm?.notConfigured) {
+        pu.tokenrhythm = { ...pu.tokenrhythm, notConfigured: true, lastChecked: new Date().toISOString() };
+        data.providerUsage["tokenrhythm"] = pu;
+        markDirty();
+      }
+      return;
+    }
+    const usage = await checkTokenRhythmUsage(cookie);
+    if (!usage) return;
+    // 合并写入，保留 message 事件累计的 cost 等字段
+    pu.tokenrhythm = usage;
+    data.providerUsage["tokenrhythm"] = pu;
+    markDirty();
+  };
+  void pollTokenRhythm();
+  addInterval(() => { void pollTokenRhythm(); }, CONFIG.providerCheckIntervalMs);
 
   addInterval(() => {
     if (trackedResponses.size > 10000) trackedResponses.clear();
@@ -1107,7 +1210,11 @@ const UsagePlugin = Plugin.define({
     });
   });
 
+  ready = true;
+
   return () => {
+    // 先停机再落盘：避免清理过程中还有定时器往文件里写
+    ready = false;
     controller.abort();
     for (const timer of intervals) clearInterval(timer);
     saveData(dataFile, data);
