@@ -82,7 +82,10 @@ npx tsc   # 可选，类型检查/构建
 }
 ```
 
-`language` 支持 `"en"`（默认）和 `"zh"`（中文）。不需要单独配置 `tui.json`
+`language` 支持 `"en"`（默认）和 `"zh"`（中文）。插件按
+①opencode.json 里的 `options` → ②插件自己的配置文件
+`~/.opencode/oc-plugin-usage-config.json` 里的 `language` → ③`en` 的顺序解析，
+改完重启 opencode 生效；`usageThresholdPercent` 同样支持这两种写法。不需要单独配置 `tui.json`
 或 `cli.json`，OpenCode V2 会自动加载插件包的 `./tui` 导出。
 
 ### 3. 重启 opencode

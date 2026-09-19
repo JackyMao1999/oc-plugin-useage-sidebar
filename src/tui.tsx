@@ -59,11 +59,15 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs"
 
 // join         : 拼接文件路径（跨平台兼容）
 //               例：join("/home/user", ".opencode", "data.json") → "/home/user/.opencode/data.json"
-import { join } from "path"
+// dirname / isAbsolute / resolve : 路径处理（用于把配置里的 package 路径和本插件目录做比对）
+import { join, dirname, isAbsolute } from "path"
 
 // homedir      : 获取当前用户的家目录路径
 //               例：homedir() → "/home/ubuntu"
 import { homedir } from "os"
+
+// fileURLToPath : 把 import.meta.url 转成普通文件路径（用来定位本插件所在目录）
+import { fileURLToPath } from "url"
 
 
 // ============================================================================
@@ -78,27 +82,97 @@ const DATA_FILE = join(homedir(), ".opencode", "oc-plugin-usage-data.json")
 // 阈值配置文件（调整快捷键见下方 thresholdKeyHint）
 const CONFIG_FILE = join(homedir(), ".opencode", "oc-plugin-usage-config.json")
 
-// 读取用量提醒阈值（%）：文件（手动调整） > 默认 80
-function readThresholdFile(): number {
+// 插件自己的小配置文件（阈值 / 语言等），也是 opencode.json 之外的手动覆盖入口
+function readPluginConfig(): Record<string, any> {
   try {
     if (existsSync(CONFIG_FILE)) {
-      const n = Number(JSON.parse(readFileSync(CONFIG_FILE, "utf-8"))?.usageThresholdPercent)
-      if (Number.isFinite(n) && n > 0 && n <= 100) return n
+      const parsed = JSON.parse(readFileSync(CONFIG_FILE, "utf-8"))
+      if (parsed && typeof parsed === "object") return parsed
     }
   } catch {
     // 文件损坏时用默认值
   }
+  return {}
+}
+
+// 只更新指定字段，保留文件里其它字段（例如改阈值时不会把 language 抹掉）
+function writePluginConfig(patch: Record<string, any>) {
+  try {
+    mkdirSync(join(homedir(), ".opencode"), { recursive: true })
+    writeFileSync(CONFIG_FILE, JSON.stringify({ ...readPluginConfig(), ...patch }, null, 2))
+  } catch {
+    // 写入失败时静默忽略（下次调整时重试）
+  }
+}
+
+// 读取用量提醒阈值（%）：文件（手动调整） > 默认 80
+function readThresholdFile(): number {
+  const n = Number(readPluginConfig().usageThresholdPercent)
+  if (Number.isFinite(n) && n > 0 && n <= 100) return n
   return 80
 }
 
 // 写入用量提醒阈值（%）
 function writeThresholdFile(percent: number) {
+  writePluginConfig({ usageThresholdPercent: percent })
+}
+
+// 本插件包所在目录（.../src/tui.tsx → 包根目录），用于在配置里找到自己那一条
+const PACKAGE_DIR = (() => {
   try {
-    mkdirSync(join(homedir(), ".opencode"), { recursive: true })
-    writeFileSync(CONFIG_FILE, JSON.stringify({ usageThresholdPercent: percent }, null, 2))
+    return dirname(dirname(fileURLToPath(import.meta.url)))
   } catch {
-    // 写入失败时静默忽略（下次调整时重试）
+    return ""
   }
+})()
+
+function asLanguage(value: unknown): Lang | undefined {
+  return value === "zh" || value === "en" ? value : undefined
+}
+
+// 配置里的 package 是否指向本插件（支持写包名、包目录、包目录/src）
+function matchesPackage(target: unknown, packageDir: string): boolean {
+  if (typeof target !== "string" || !target) return false
+  const path = target.replace(/^file:\/\//, "")
+  if (path === "oc-plugin-usage" || path === "oc-plugin-useage-sidebar") return true
+  if (!packageDir || !isAbsolute(path)) return false
+  return path === packageDir || path === join(packageDir, "src") || dirname(path) === packageDir
+}
+
+/**
+ * 读取本插件的配置项（opencode.json 里 `plugins[].options`）。
+ *
+ * 正常情况下 V2 会通过 `context.options` 直接传进来。但实测存在不可靠的情况
+ * （把 language 改成 zh、重启后侧边栏仍是英文），所以这里改成以"生效配置"为准：
+ * 直接问 opencode 要一份它自己正在用的配置（client.config.get，接口说明里写明
+ * 分层文档按优先级从低到高返回，所以后面的覆盖前面的），在其中找到指向本插件的
+ * 那几条 entry 并合并 options。拿不到时再退回 context.options，最后才是插件自己
+ * 的配置文件。
+ */
+async function resolvePluginOptions(context: any): Promise<Record<string, any>> {
+  const fromContext =
+    context?.options && typeof context.options === "object" ? (context.options as Record<string, any>) : {}
+
+  let fromConfig: Record<string, any> = {}
+  try {
+    const entries = (await Promise.race([
+      context?.client?.config?.get?.(),
+      new Promise((resolve) => setTimeout(() => resolve(undefined), 2000)),
+    ])) as any[] | undefined
+    for (const entry of entries ?? []) {
+      for (const item of entry?.info?.plugins ?? []) {
+        if (typeof item === "string" || !item) continue
+        if (!matchesPackage(item.package, PACKAGE_DIR)) continue
+        // 按优先级从低到高遍历，越靠后越具体（项目级覆盖全局），直接覆盖即可
+        fromConfig = { ...fromConfig, ...(item.options ?? {}) }
+      }
+    }
+  } catch {
+    // 取不到生效配置时继续用 context.options / 插件配置文件
+  }
+
+  // 生效配置优先（一定是最新的），context.options 只补它没有的键
+  return { ...fromContext, ...fromConfig }
 }
 
 // fmtPct: 百分比格式化 —— 整数不带小数点（API 返回整数时避免假的 ".0"），
@@ -1443,10 +1517,11 @@ function createTuiApi(context: any) {
 
 const TuiPlugin = Plugin.define({
   id: "oc-plugin-usage.tui",
-  setup(context) {
-    const options = context.options as { language?: string }
-    const lang: Lang = options.language === "zh" ? "zh" : "en"
-    const configuredThreshold = Number((context.options as any).usageThresholdPercent)
+  async setup(context) {
+    // 语言优先级：opencode.json 里的 options.language > 插件配置文件里的 language > en
+    const options = await resolvePluginOptions(context)
+    const lang: Lang = asLanguage(options.language) ?? asLanguage(readPluginConfig().language) ?? "en"
+    const configuredThreshold = Number(options.usageThresholdPercent)
     if (!existsSync(CONFIG_FILE) && Number.isFinite(configuredThreshold) && configuredThreshold > 0 && configuredThreshold <= 100) {
       writeThresholdFile(configuredThreshold)
     }

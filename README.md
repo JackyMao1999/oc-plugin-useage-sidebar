@@ -85,7 +85,10 @@ Global config (`~/.config/opencode/opencode.json`, or `~/.opencode/opencode.json
 }
 ```
 
-`language` accepts `"en"` (default) or `"zh"`. No separate `tui.json` or
+`language` accepts `"en"` (default) or `"zh"`. The plugin resolves it from
+①`options` in `opencode.json` → ②`language` in the plugin's own config file
+`~/.opencode/oc-plugin-usage-config.json` → ③`en`; restart opencode after
+changing it. `usageThresholdPercent` can be set the same two ways. No separate `tui.json` or
 `cli.json` entry is needed: OpenCode V2 loads the package's `./tui` export.
 
 ### 3. Restart opencode
