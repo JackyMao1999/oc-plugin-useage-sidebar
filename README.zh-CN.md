@@ -6,10 +6,11 @@
 
 ## 功能
 
+- **跟随当前模型** — 侧边栏只显示当前使用中的那一个提供商；在 `/models` 里一选新模型就立刻切换（opencode 要等下一次发消息才把选择落库，插件通过 `~/.local/state/opencode/model.json` 提前跟随）
 - **会话缓存命中率** — 实时统计当前会话的 `cache read / (input + read)`，显示 Hit rate、Input、Read、Write
 - **响应速度** — 统计首字延迟（TTFT）和输出速度（Tokens/s）；侧边栏显示当前会话平均值，`usage_stats` 显示持久化累计值
 - **Go 套餐用量** — 通过官方 API 显示 Rolling 5h / Weekly / Monthly 的已用百分比 + 重置倒计时（超过 24 小时自动显示为天）
-- **ChatGPT 用量** — 读取 ChatGPT 后台的 `wham/usage` 和 `wham/usage/credit-usage-events`，显示计划类型、5小时/每周限额窗口、剩余 Credits，以及与 Codex Cloud Analytics 一致的近7天 Codex/Work Credits 汇总；用标准 OpenAI OAuth 登录即可，无需 API key，access token 自动刷新
+- **ChatGPT 用量** — 读取 ChatGPT 后台的 `wham/usage` 和 `wham/usage/credit-usage-events`，显示计划类型、限额窗口（按 `limit_window_seconds` 自动识别 5 小时 / 每周 / 月度，账号有哪些窗口就显示哪些）、剩余 Credits，以及与 Codex Cloud Analytics 一致的近7天 Codex/Work Credits 汇总；用标准 OpenAI OAuth 登录即可，无需 API key。凭证直接读 OpenCode V2 的凭证存储，插件不会自己去刷 OpenAI 的一次性 refresh token（由 opencode 负责续期）
 - **TokenRhythm 账户** — 当前提供商为 `tokenrhythm` 时，侧边栏显示 tokenrhythm.studio 的**实际可用总额**和**累计成本**（与账户页同源数字）；需要浏览器会话 Cookie（见下文）
 - **DeepSeek 余额** — 当前提供商为 `deepseek` 时，通过 DeepSeek API key 显示总余额、充值余额和赠送余额；自动读取 OpenCode 登录保存的 key，也可手动配置
 - **Provider 配额（可选）** — 连接 OpenAI/Anthropic 计费 API，显示真实费用和限额
@@ -19,6 +20,32 @@
 
 ## 安装
 
+### 一键安装（推荐）
+
+克隆仓库后直接执行：
+
+```bash
+./install.sh
+```
+
+安装器会安装依赖、用绝对路径注册本地插件包，并在修改配置前自动备份已有
+配置；重复执行不会产生重复条目。OpenCode V2 会自动加载插件包的 `./tui`
+导出作为侧边栏。侧边栏使用中文时执行：
+
+```bash
+./install.sh --language zh
+```
+
+以后如需移除注册（不会删除用量数据），执行：
+
+```bash
+./install.sh --uninstall
+```
+
+更多选项可查看 `./install.sh --help`，包括试运行、跳过依赖安装和自定义配置目录。
+
+> 当前仓库适配 OpenCode V2 插件 API。
+
 ### 1. 克隆 / 复制插件
 
 ```bash
@@ -26,48 +53,39 @@ git clone git@github.com:JackyMao1999/oc-plugin-useage.git
 # 或把文件夹复制到任意位置，例如 ~/.opencode/plugins/oc-plugin-usage
 ```
 
-安装依赖（本地开发 / 编译时需要）：
+安装依赖（使用一键安装器时会自动执行）：
 
 ```bash
 cd oc-plugin-usage
 npm install
-npx tsc   # 可选，只有修改源码后才需要
+npx tsc   # 可选，类型检查/构建
 ```
 
-### 2. 注册 Server 插件（opencode.json）
+### 2. 注册插件（opencode.json）
 
-**重要：** 必须使用 `src/index.ts` 的**绝对路径**。不要写裸名 `"oc-plugin-usage"` —— 那会解析成 npm 上的无关同名包，而不是本插件。
+使用克隆后插件目录的**绝对路径**。除非插件已经发布到 npm，否则不要直接写裸名
+`"oc-plugin-usage"`。
 
 全局配置（`~/.config/opencode/opencode.json` 或 `~/.opencode/opencode.json`）：
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["/path/to/oc-plugin-usage/src/index.ts"]
+  "plugins": [
+    {
+      "package": "/path/to/oc-plugin-useage-sidebar",
+      "options": {
+        "language": "zh"
+      }
+    }
+  ]
 }
 ```
 
-### 3. 注册侧边栏（TUI）插件（tui.json）
+`language` 支持 `"en"`（默认）和 `"zh"`（中文）。不需要单独配置 `tui.json`
+或 `cli.json`，OpenCode V2 会自动加载插件包的 `./tui` 导出。
 
-创建 `~/.config/opencode/tui.json`（或 `~/.opencode/tui.json`）：
-
-```json
-{
-  "plugin": ["/path/to/oc-plugin-usage/src/tui.tsx"]
-}
-```
-
-可选：用元组形式把侧边栏语言设为中文：
-
-```json
-{
-  "plugin": [["/path/to/oc-plugin-usage/src/tui.tsx", { "language": "zh" }]]
-}
-```
-
-`language` 支持 `"en"`（默认）和 `"zh"`（中文）。
-
-### 4. 重启 opencode
+### 3. 重启 opencode
 
 插件只在启动时加载。退出后重新运行 `opencode` —— 右侧侧边栏会出现 **Usage → Session Cache → Providers**。
 
@@ -86,12 +104,16 @@ Authorization: Bearer <opencode-go key>
 
 ```json
 {
-  "plugin": [["/path/to/oc-plugin-usage/src/index.ts", {
-    "openaiApiKey": "sk-...",
-    "anthropicApiKey": "sk-ant-...",
-    "deepseekApiKey": "sk-...",
-    "usageThresholdPercent": 80
-  }]]
+  "plugins": [{
+    "package": "/path/to/oc-plugin-useage-sidebar",
+    "options": {
+      "openaiApiKey": "sk-...",
+      "anthropicApiKey": "sk-ant-...",
+      "deepseekApiKey": "sk-...",
+      "usageThresholdPercent": 80,
+      "language": "zh"
+    }
+  }]
 }
 ```
 
@@ -122,9 +144,10 @@ tokenrhythm.studio 的管理接口只认浏览器登录会话，`sk_tr_...` API 
 | 事件 | 统计内容 |
 |------|----------|
 | `session.created` | 会话数 |
-| `session.error` | 错误数 |
+| `session.execution.failed` | 错误数 |
 | `tool.execute.after` | 各工具调用次数 |
-| `file.edited` | 文件修改次数 |
+| `filesystem.changed` | 文件修改次数 |
+| `session.usage.updated` | 累计费用和 Token 用量 |
 
 配置 key 后还会收集 Provider 数据：费用、token 数、套餐限额、剩余额度。响应速度指标在流式文本开始和助手消息完成时自动采集；输出速度按输出 tokens /（首字到完成的时间）计算。
 
@@ -144,7 +167,7 @@ tokenrhythm.studio 的管理接口只认浏览器登录会话，`sk_tr_...` API 
 ~/.opencode/oc-plugin-usage-data.json
 ```
 
-按自然日聚合。配置 API key 后，Provider 数据每 5 分钟更新一次。
+按自然日聚合。配置 API key 后，Provider 数据每分钟更新一次。
 
 ## 构建
 

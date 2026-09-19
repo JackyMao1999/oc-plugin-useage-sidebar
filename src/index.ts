@@ -1,47 +1,14 @@
-import { tool } from "@opencode-ai/plugin";
-import type { Plugin, PluginInput } from "@opencode-ai/plugin";
-import type { Event } from "@opencode-ai/sdk";
+import { Plugin } from "@opencode/plugin";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
 import { homedir } from "os";
 
 const CONFIG = {
-  thresholdPercent: 80,
-  saveIntervalMs: 30000,
+  // V2 的 TUI 侧边栏从同一个 JSON 文件读数据，写得太慢会导致切换供应商后长时间看不到新数据
+  saveIntervalMs: 5000,
   providerCheckIntervalMs: 60000,
   dataFileName: "oc-plugin-usage-data.json",
 };
-
-// 阈值配置文件：TUI 插件手动调整阈值时写入，Server 每轮询读取，两边保持一致
-const CONFIG_FILE = join(homedir(), ".opencode", "oc-plugin-usage-config.json");
-
-// 读取阈值：文件（用户手动调整） > 插件选项 > 默认 80
-function readThresholdFile(): number {
-  try {
-    if (existsSync(CONFIG_FILE)) {
-      const n = Number(JSON.parse(readFileSync(CONFIG_FILE, "utf-8"))?.usageThresholdPercent);
-      if (Number.isFinite(n) && n > 0 && n <= 100) return n;
-    }
-  } catch {
-    // 文件损坏时用默认值
-  }
-  return CONFIG.thresholdPercent;
-}
-
-// 已提醒过的百分比：只在"跨越阈值"时提醒一次，避免每轮轮询都弹
-//   1. 首次达到阈值 → 提醒
-//   2. 比上次提醒高了 ≥10 个百分点 → 提醒（80→90→100 逐步升级）
-//   3. 上次提醒时还没到阈值（阈值被调低了）→ 提醒
-const notifiedPct = new Map<string, number>();
-function crossedThreshold(key: string, pct: number, threshold: number): boolean {
-  const last = notifiedPct.get(key);
-  if (pct < threshold) return false;
-  if (last === undefined || last < threshold || pct >= last + 10) {
-    notifiedPct.set(key, pct);
-    return true;
-  }
-  return false;
-}
 
 function todayKey(): string {
   return new Date().toISOString().slice(0, 10);
@@ -96,6 +63,9 @@ interface GoApiWindow {
   status?: string;
   percent: number;
   resetsAt?: string;
+  // 窗口长度（秒）。ChatGPT 的 wham/usage 用同一个 primary/secondary 字段返回不同
+  // 粒度的窗口：18000=5h、604800=7d、2592000=30d，展示层据此选择标签。
+  windowSeconds?: number;
 }
 interface GoApiUsage {
   rolling: GoApiWindow;
@@ -112,6 +82,7 @@ interface ResponseMetrics {
 }
 
 interface ResponseState {
+  sessionID?: string;
   providerID?: string;
   createdAt?: number;
   firstTokenAt?: number;
@@ -156,10 +127,11 @@ interface DeepSeekUsage {
 }
 
 // ChatGPT (chatgpt.com) 用量 —— 来自 backend-api/wham/usage
+// 窗口粒度不固定（5 小时 / 每周 / 月度，由 windowSeconds 决定），标签交给展示层推导
 interface ChatGptUsage {
   planType?: string;
-  primary: GoApiWindow;    // 5 小时窗口
-  secondary?: GoApiWindow; // 每周窗口（部分账号可能没有）
+  primary: GoApiWindow;
+  secondary?: GoApiWindow; // 部分账号（含免费/企业）只有单一窗口
   credits?: number;        // 剩余 Credits
   creditUsage?: ChatGptCreditUsage;
   lastChecked?: string;
@@ -254,17 +226,6 @@ function calculateGoWindows(pu: ProviderUsage): GoWindows {
   };
 }
 
-function readGoKeyFromAuth(): string | null {
-  try {
-    const authPath = join(homedir(), ".local", "share", "opencode", "auth.json");
-    if (!existsSync(authPath)) return null;
-    const auth = JSON.parse(readFileSync(authPath, "utf-8"));
-    return auth["opencode-go"]?.key || null;
-  } catch {
-    return null;
-  }
-}
-
 async function checkGoUsage(apiKey: string): Promise<GoApiUsage | null> {
   try {
     const resp = await fetch("https://opencode.ai/zen/go/v1/usage", {
@@ -285,45 +246,75 @@ async function checkGoUsage(apiKey: string): Promise<GoApiUsage | null> {
   }
 }
 
-// ChatGPT OAuth 客户端 ID（与 Codex CLI 一致，用于刷新 access token）
-const CHATGPT_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+// ============================================================================
+// V2 凭证读取
+// ----------------------------------------------------------------------------
+// OpenCode V2 不再使用 ~/.local/share/opencode/auth.json：凭证存放在
+// opencode.db 的 credential 表里，插件只能通过 ctx.integration.connection 读取。
+// connection.resolve() 会在 access token 剩余有效期不足 5 分钟时，用
+// integration 自己注册的 refresh 方法刷新并写回存储，所以插件不需要（也不应该）
+// 自己刷新 OpenAI 的一次性 refresh token。
+// ============================================================================
 
-// 通过 refresh token 换取 access token，并把新的 token 写回 auth.json。
-// OpenAI 的 refresh token 是一次性的（旋转）：一旦被消费，旧的 refresh token 立即失效。
-// 因此必须把刷新结果写回 auth.json，否则 opencode 与插件会互相把对方的 refresh token 弄失效。
-async function refreshChatGptToken(refresh: string): Promise<{ access: string; expires: number; refresh: string } | null> {
+interface ProviderCredential {
+  type?: string;
+  access?: string;
+  refresh?: string;
+  expires?: number;
+  key?: string;
+  accountId?: string;
+}
+
+// provider 内部 ID → 可能的 integration ID（V2 里两者命名不一定一致）
+const INTEGRATION_IDS: Record<string, string[]> = {
+  openai: ["openai"],
+  anthropic: ["anthropic"],
+  deepseek: ["deepseek"],
+  "opencode-go": ["opencode-go", "opencode", "opencode-zen", "zen"],
+};
+
+function normalizeCredential(value: any): ProviderCredential | null {
+  if (!value || typeof value !== "object") return null;
+  const expires = Number(value.expires);
+  const metadata = value.metadata && typeof value.metadata === "object" ? value.metadata : {};
+  return {
+    type: typeof value.type === "string" ? value.type : undefined,
+    access: typeof value.access === "string" && value.access ? value.access : undefined,
+    refresh: typeof value.refresh === "string" && value.refresh ? value.refresh : undefined,
+    expires: Number.isFinite(expires) ? expires : undefined,
+    key: typeof value.key === "string" && value.key.trim() ? value.key.trim() : undefined,
+    accountId: typeof metadata.accountID === "string" ? metadata.accountID : undefined,
+  };
+}
+
+// V1 回退：老版本把凭证放在 auth.json。V2 下该文件通常不存在。
+function readLegacyCredential(providerID: string): ProviderCredential | null {
   try {
-    const resp = await fetch("https://auth.openai.com/oauth/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(refresh)}&client_id=${CHATGPT_OAUTH_CLIENT_ID}`,
-    });
-    if (!resp.ok) return null;
-    const json: any = await resp.json();
-    if (!json?.access_token) return null;
-    const next = {
-      access: json.access_token,
-      expires: Date.now() + (json.expires_in || 3600) * 1000,
-      refresh: json.refresh_token || refresh,
-    };
-    try {
-      const authPath = join(homedir(), ".local", "share", "opencode", "auth.json");
-      if (existsSync(authPath)) {
-        const auth = JSON.parse(readFileSync(authPath, "utf-8"));
-        if (auth["openai"]) {
-          auth["openai"].access = next.access;
-          auth["openai"].refresh = next.refresh;
-          auth["openai"].expires = next.expires;
-          writeFileSync(authPath, JSON.stringify(auth, null, 2));
-        }
-      }
-    } catch {
-      // 写回失败不影响本次查询（token 已在内存中）
-    }
-    return next;
+    const authPath = join(homedir(), ".local", "share", "opencode", "auth.json");
+    if (!existsSync(authPath)) return null;
+    const auth = JSON.parse(readFileSync(authPath, "utf-8"));
+    return normalizeCredential(auth?.[providerID]);
   } catch {
     return null;
   }
+}
+
+// 读取某个 provider 的当前凭证：V2 优先，读不到再回退 auth.json。
+async function readCredential(ctx: any, providerID: string): Promise<ProviderCredential | null> {
+  const connection = ctx?.integration?.connection;
+  if (connection?.active && connection?.resolve) {
+    for (const integrationID of INTEGRATION_IDS[providerID] ?? [providerID]) {
+      try {
+        const active = await connection.active(integrationID);
+        if (!active) continue;
+        const value = normalizeCredential(await connection.resolve(active));
+        if (value) return value;
+      } catch {
+        // 该 integration 未登录 / 不可用，尝试下一个候选 ID
+      }
+    }
+  }
+  return readLegacyCredential(providerID);
 }
 
 function chatGptAccountHeaders(accountId?: string): Record<string, string> {
@@ -331,35 +322,18 @@ function chatGptAccountHeaders(accountId?: string): Record<string, string> {
   return id && id !== "personal" ? { "ChatGPT-Account-ID": id } : {};
 }
 
-// 查询 ChatGPT 用量（chatgpt.com 后台的 wham/usage，与 Codex Cloud 分析页同一数据源）
-async function checkChatGPTUsage(accountId?: string): Promise<ChatGptUsage | null> {
+// 查询 ChatGPT 用量（chatgpt.com 后台的 wham/usage，与 Codex Cloud 分析页同一数据源）。
+// 返回的 primary/secondary 窗口粒度不固定：5 小时（18000s）、每周（604800s）、
+// 月度（2592000s）都出现过，因此这里同时记录 limit_window_seconds，交给展示层决定标签。
+async function checkChatGPTUsage(credential: ProviderCredential | null, accountId?: string): Promise<ChatGptUsage | null> {
   try {
-    const authPath = join(homedir(), ".local", "share", "opencode", "auth.json");
-    if (!existsSync(authPath)) return null;
-    const auth = JSON.parse(readFileSync(authPath, "utf-8"));
-    const oa = auth["openai"];
-    if (!oa) return null;
-
-    // 优先使用 auth.json 里 opencode 维护的 access token（opencode 会在后台刷新并写回）。
-    // 不要单独用缓存的 refresh token 刷新：OpenAI 的 refresh token 是一次性的，
-    // 插件抢先刷新会消耗掉 opencode 手里的 refresh token，导致两边都用不了，
-    // 从而造成用量百分比一直停留在旧值。
-    let access: string | null =
-      typeof oa.access === "string" && oa.access ? oa.access : null;
-    const expires = Number(oa.expires);
-    if (access && (!Number.isFinite(expires) || expires < Date.now() + 5 * 60 * 1000)) {
-      access = null; // access token 缺失或即将过期，走 refresh 分支
-    }
-    if (!access) {
-      if (typeof oa.refresh !== "string" || !oa.refresh) return null;
-      const refreshed = await refreshChatGptToken(oa.refresh);
-      if (!refreshed) return null;
-      access = refreshed.access;
-    }
+    if (!credential || credential.type !== "oauth" || !credential.access) return null;
+    // resolve() 已负责续期；此时仍然过期说明 opencode 侧刷新失败，等下一轮
+    if (credential.expires != null && credential.expires < Date.now()) return null;
 
     const headers = {
-      Authorization: `Bearer ${access}`,
-      ...chatGptAccountHeaders(accountId),
+      Authorization: `Bearer ${credential.access}`,
+      ...chatGptAccountHeaders(accountId ?? credential.accountId),
     };
     const [resp, creditsResp] = await Promise.all([
       fetch("https://chatgpt.com/backend-api/wham/usage", { headers }),
@@ -374,10 +348,18 @@ async function checkChatGPTUsage(accountId?: string): Promise<ChatGptUsage | nul
       const percent = Number(x.used_percent);
       if (!Number.isFinite(percent)) return undefined;
       const resetAt = Number(x.reset_at);
+      const resetAfter = Number(x.reset_after_seconds);
+      const windowSeconds = Number(x.limit_window_seconds);
+      const resetsAtMs = Number.isFinite(resetAt) && resetAt > 0
+        ? resetAt * 1000
+        : Number.isFinite(resetAfter) && resetAfter > 0
+          ? Date.now() + resetAfter * 1000
+          : undefined;
       return {
         status: typeof x.status === "string" ? x.status : undefined,
         percent,
-        resetsAt: Number.isFinite(resetAt) && resetAt > 0 ? new Date(resetAt * 1000).toISOString() : undefined,
+        resetsAt: resetsAtMs != null ? new Date(resetsAtMs).toISOString() : undefined,
+        windowSeconds: Number.isFinite(windowSeconds) && windowSeconds > 0 ? windowSeconds : undefined,
       };
     };
     const primary = window(rl.primary_window);
@@ -465,47 +447,6 @@ async function checkTokenRhythmUsage(cookie: string): Promise<TokenRhythmUsage |
   }
 }
 
-async function bootstrapGoHistory(ctx: any, data: UsageData, trackedCosts: Set<string>): Promise<void> {
-  const log = (msg: string) => {
-    try { ctx.client?.app?.log({ body: { service: "oc-plugin-usage", level: "info", message: msg } }); } catch {}
-  };
-  try {
-    const sessionsRes = await ctx.client.v2.session.list({ directory: ctx.directory });
-    const sessions: any[] = sessionsRes?.data?.data || [];
-    const processed = new Set(data.processedSessions || []);
-
-    for (const session of sessions) {
-      if (processed.has(session.id)) continue;
-      processed.add(session.id);
-
-      const pid = session.model?.providerID || "unknown";
-      const cost = session.cost || 0;
-      if (cost <= 0) continue;
-
-      if (!data.providerUsage[pid]) {
-        data.providerUsage[pid] = { cost: 0, lastChecked: new Date().toISOString() };
-      }
-      data.providerUsage[pid].cost = (data.providerUsage[pid].cost || 0) + cost;
-
-      if (pid === "opencode-go") {
-        const go = data.providerUsage[pid]!;
-        if (!go.dailyCosts) go.dailyCosts = {};
-        const ts = session.time?.created || Date.now();
-        const dateKey = new Date(ts).toISOString().slice(0, 10);
-        go.dailyCosts[dateKey] = (go.dailyCosts[dateKey] || 0) + cost;
-        if (!go.recentEvents) go.recentEvents = [];
-        if (ts > Date.now() - 6 * 60 * 60 * 1000) {
-          go.recentEvents.push({ time: ts, cost });
-        }
-        go.goWindows = calculateGoWindows(go);
-      }
-    }
-    data.processedSessions = Array.from(processed);
-  } catch (e) {
-    log(`bootstrap: error: ${e}`);
-  }
-}
-
 const DISPLAY_NAMES: Record<string, string> = {
   openai: "OpenAI",
   anthropic: "Anthropic",
@@ -522,18 +463,6 @@ interface PluginOptions {
   tokenrhythmCookie?: string;
   deepseekApiKey?: string;
   usageThresholdPercent?: number;
-}
-
-function readProviderKey(provider: string): string | null {
-  try {
-    const authPath = join(homedir(), ".local", "share", "opencode", "auth.json");
-    if (!existsSync(authPath)) return null;
-    const auth = JSON.parse(readFileSync(authPath, "utf-8"));
-    const key = auth[provider]?.key;
-    return typeof key === "string" && key.trim() ? key.trim() : null;
-  } catch {
-    return null;
-  }
 }
 
 function loadData(filePath: string): UsageData {
@@ -632,6 +561,19 @@ function formatDurationMs(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
 }
 
+// 由窗口长度推断标签：5 小时 / 24 小时 / 每周 / 每月。
+// OpenAI 的 wham/usage 用同一组 primary/secondary 字段返回不同粒度的窗口
+// （免费/企业账号是月度，Plus/Pro 是 5h + 每周），不能写死。
+function windowLabel(w: GoApiWindow): string {
+  const s = w.windowSeconds;
+  if (!s || !Number.isFinite(s)) return "5h";
+  if (s <= 6 * 3600) return "5h";
+  if (s <= 2 * 86400) return "24h";
+  if (s <= 10 * 86400) return "weekly";
+  if (s <= 45 * 86400) return "monthly";
+  return `${Math.round(s / 86400)}d`;
+}
+
 function formatProviderUsage(pu: ProviderUsage, label: string): string {
   const lines: string[] = [`--- ${label} ---`];
   const fmtPct = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(1));
@@ -639,8 +581,10 @@ function formatProviderUsage(pu: ProviderUsage, label: string): string {
     const fmt = (w: GoApiWindow) =>
       `${fmtPct(w.percent)}% used${w.resetsAt ? ` (resets ${new Date(w.resetsAt).toLocaleString()})` : ""}`;
     if (pu.chatgpt.planType) lines.push(`  Plan:       ${pu.chatgpt.planType}`);
-    lines.push(`  5h:         ${fmt(pu.chatgpt.primary)}`);
-    if (pu.chatgpt.secondary) lines.push(`  Weekly:     ${fmt(pu.chatgpt.secondary)}`);
+    lines.push(`  ${windowLabel(pu.chatgpt.primary).padEnd(10)} ${fmt(pu.chatgpt.primary)}`);
+    if (pu.chatgpt.secondary) {
+      lines.push(`  ${windowLabel(pu.chatgpt.secondary).padEnd(10)} ${fmt(pu.chatgpt.secondary)}`);
+    }
     if (pu.chatgpt.credits != null) lines.push(`  Credits:    ${pu.chatgpt.credits.toFixed(1)}`);
     if (pu.chatgpt.creditUsage) {
       lines.push(`  Credits 7d: ${pu.chatgpt.creditUsage.last7Days.total.toFixed(1)}`);
@@ -780,65 +724,31 @@ async function checkDeepSeekBalance(apiKey: string): Promise<DeepSeekUsage | nul
   }
 }
 
-type ToastApi = { showToast: (input: { body: { message: string; variant: "info" | "warning" | "error" } }) => Promise<void> };
-
-async function notifyThreshold(
-  api: { tui?: ToastApi },
-  provider: string,
-  pct: number,
-  cost: number,
-  limit: number | null,
-): Promise<void> {
-  if (!api?.tui?.showToast) return;
-  try {
-    await api.tui.showToast({
-      body: {
-        message: `${provider}: ${pct.toFixed(0)}% of limit used ($${cost.toFixed(2)} / $${limit})`,
-        variant: pct >= 100 ? "error" : "warning",
-      },
-    });
-  } catch {
-    // toast may not be available in non-TUI mode
-  }
-}
-
-async function tryShowToast(ctx: any, message: string, variant: "info" | "success" | "warning" | "error" = "info") {
-  try {
-    await ctx.tui.showToast({ body: { message, variant } });
-  } catch {
-    // TUI 不可用时静默失败
-  }
-}
-
-const UsagePlugin: Plugin = async (ctx, rawOptions) => {
-  const opts = (rawOptions || {}) as PluginOptions;
+const UsagePlugin = Plugin.define({
+  id: "oc-plugin-usage",
+  async setup(ctx) {
+  const opts = (ctx.options || {}) as PluginOptions;
   const dataFile = join(homedir(), ".opencode", CONFIG.dataFileName);
   const data = loadData(dataFile);
   let unsaved = false;
+
+  const intervals: ReturnType<typeof setInterval>[] = [];
+  const addInterval = (callback: () => void, delay: number) => {
+    const timer = setInterval(callback, delay);
+    intervals.push(timer);
+    return timer;
+  };
 
   function markDirty() {
     unsaved = true;
   }
 
-  const saveTimer = setInterval(() => {
+  addInterval(() => {
     if (unsaved) {
       saveData(dataFile, data);
       unsaved = false;
     }
   }, CONFIG.saveIntervalMs);
-
-  if ((ctx as any)?.tui?.showToast) {
-    try {
-      await (ctx as any).tui.showToast({
-        body: {
-          message: "oc-plugin-usage started",
-          variant: "info",
-        },
-      });
-    } catch {
-      // toast may not be available in non-TUI mode
-    }
-  }
 
   if (opts.openaiApiKey) {
     const poll = async () => {
@@ -846,15 +756,9 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
       if (!pu) return;
       data.providerUsage.openai = { ...data.providerUsage.openai, ...pu };
       markDirty();
-      if (pu.limit != null && pu.cost != null && pu.limit > 0) {
-        const pct = (pu.cost / pu.limit) * 100;
-        if (crossedThreshold("openai.cost", pct, readThresholdFile())) {
-          await notifyThreshold(ctx as any, "OpenAI", pct, pu.cost, pu.limit);
-        }
-      }
     };
     poll();
-    setInterval(poll, CONFIG.providerCheckIntervalMs);
+    addInterval(() => { void poll(); }, CONFIG.providerCheckIntervalMs);
   }
 
   if (opts.anthropicApiKey) {
@@ -863,21 +767,18 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
       if (!pu) return;
       data.providerUsage.anthropic = { ...data.providerUsage.anthropic, ...pu };
       markDirty();
-      if (pu.limit != null && pu.cost != null && pu.limit > 0) {
-        const pct = (pu.cost / pu.limit) * 100;
-        if (crossedThreshold("anthropic.cost", pct, readThresholdFile())) {
-          await notifyThreshold(ctx as any, "Anthropic", pct, pu.cost, pu.limit);
-        }
-      }
     };
     poll();
-    setInterval(poll, CONFIG.providerCheckIntervalMs);
+    addInterval(() => { void poll(); }, CONFIG.providerCheckIntervalMs);
   }
 
-  const deepseekKey = opts.deepseekApiKey || readProviderKey("deepseek");
+  const deepseekKey = opts.deepseekApiKey || (await readCredential(ctx, "deepseek"))?.key || null;
   if (deepseekKey) {
     const pollDeepSeek = async () => {
-      const usage = await checkDeepSeekBalance(deepseekKey);
+      // 每轮重新读取：用户在 opencode 里重新登录后无需重启插件
+      const key = opts.deepseekApiKey || (await readCredential(ctx, "deepseek"))?.key;
+      if (!key) return;
+      const usage = await checkDeepSeekBalance(key);
       if (!usage) return;
       const pu = data.providerUsage.deepseek || { lastChecked: new Date().toISOString() };
       pu.deepseek = usage;
@@ -885,22 +786,27 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
       markDirty();
     };
     pollDeepSeek();
-    setInterval(pollDeepSeek, CONFIG.providerCheckIntervalMs);
+    addInterval(() => { void pollDeepSeek(); }, CONFIG.providerCheckIntervalMs);
   }
 
-  const trackedCosts = new Set<string>();
   const responseStates = new Map<string, ResponseState>();
   const trackedResponses = new Set<string>();
+  const sessionModels = new Map<string, string>();
+  const sessionCosts = new Map<string, number>();
+  const sessionTokens = new Map<string, number>();
 
   const finiteTimestamp = (value: unknown): number | undefined => {
     const n = Number(value);
     return Number.isFinite(n) && n >= 0 ? n : undefined;
   };
 
-  const ensureResponseState = (messageID: string) => {
+  const ensureResponseState = (messageID: string, sessionID?: string) => {
     const existing = responseStates.get(messageID);
-    if (existing) return existing;
-    const state: ResponseState = { outputTokens: 0 };
+    if (existing) {
+      if (sessionID) existing.sessionID = sessionID;
+      return existing;
+    }
+    const state: ResponseState = { sessionID, outputTokens: 0 };
     responseStates.set(messageID, state);
     return state;
   };
@@ -934,81 +840,35 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
     markDirty();
   };
 
-  const updateResponseMessage = (msg: any) => {
-    if (msg?.role !== "assistant" || typeof msg.id !== "string") return;
-    if (trackedResponses.has(msg.id)) return;
-    const state = ensureResponseState(msg.id);
-    if (typeof msg.providerID === "string" && msg.providerID) state.providerID = msg.providerID;
-    const createdAt = finiteTimestamp(msg.time?.created);
-    if (createdAt != null) state.createdAt = createdAt;
-    const completedAt = finiteTimestamp(msg.time?.completed);
-    if (completedAt != null) state.completedAt = completedAt;
-    const outputTokens = Number(msg.tokens?.output);
-    if (Number.isFinite(outputTokens) && outputTokens >= 0) {
-      state.outputTokens = Math.max(state.outputTokens, outputTokens);
-    }
-    recordResponseMetrics(msg.id);
-  };
-
-  const recordFirstResponseToken = (part: any, delta?: unknown) => {
-    if (part?.type !== "text" || part.synthetic || part.ignored || typeof part.messageID !== "string") return;
-    if (trackedResponses.has(part.messageID)) return;
-    const hasText = typeof part.text === "string" && part.text.length > 0;
-    const hasDelta = typeof delta === "string" && delta.length > 0;
-    if (!hasText && !hasDelta) return;
-    const state = ensureResponseState(part.messageID);
-    if (state.firstTokenAt == null) {
-      state.firstTokenAt = finiteTimestamp(part.time?.start) ?? Date.now();
-    }
-    recordResponseMetrics(part.messageID);
-  };
-
-  if (!data.providerUsage["opencode-go"]?.goWindows) {
-    const goKey = opts.goApiKey || readGoKeyFromAuth();
-    if (goKey) {
-      bootstrapGoHistory(ctx, data, trackedCosts).then(() => {
-        markDirty();
-      }).catch(() => {});
-    }
-  }
-
-  const goKey = opts.goApiKey || readGoKeyFromAuth();
+  const goKey = opts.goApiKey || (await readCredential(ctx, "opencode-go"))?.key || null;
   if (goKey) {
     const pollGo = async () => {
-      const goApi = await checkGoUsage(goKey!);
+      const key = opts.goApiKey || (await readCredential(ctx, "opencode-go"))?.key;
+      if (!key) return;
+      const goApi = await checkGoUsage(key);
       if (!goApi) return;
       const go = data.providerUsage["opencode-go"] || { cost: 0, lastChecked: new Date().toISOString() };
       go.goApi = goApi;
       data.providerUsage["opencode-go"] = go;
       markDirty();
-      for (const [name, w] of Object.entries({ "Rolling 5h": goApi.rolling, Weekly: goApi.weekly, Monthly: goApi.monthly })) {
-        if (crossedThreshold(`go.${name}`, w.percent, readThresholdFile())) {
-          await tryShowToast(ctx, `Go ${name}: ${w.percent.toFixed(0)}% used`, w.percent >= 100 ? "error" : "warning");
-        }
-      }
     };
-    pollGo();
-    setInterval(pollGo, CONFIG.providerCheckIntervalMs);
+    void pollGo();
+    addInterval(() => { void pollGo(); }, CONFIG.providerCheckIntervalMs);
   }
 
-  // ChatGPT 用量轮询（OAuth 登录，无需 API key）
+  // ChatGPT / Codex 用量轮询（读取 V2 的 openai OAuth 凭证，无需 API key）
   const pollChatGpt = async () => {
-    const usage = await checkChatGPTUsage(opts.chatGptAccountId);
+    // 每轮重新 resolve：opencode 会在 token 临近过期时刷新并写回存储
+    const credential = await readCredential(ctx, "openai");
+    const usage = await checkChatGPTUsage(credential, opts.chatGptAccountId);
     if (!usage) return;
     const pu = data.providerUsage["openai"] || { lastChecked: new Date().toISOString() };
     pu.chatgpt = usage;
     data.providerUsage["openai"] = pu;
     markDirty();
-    const windows: Record<string, GoApiWindow> = { "5h": usage.primary };
-    if (usage.secondary) windows.Weekly = usage.secondary;
-    for (const [name, w] of Object.entries(windows)) {
-      if (crossedThreshold(`chatgpt.${name}`, w.percent, readThresholdFile())) {
-        await tryShowToast(ctx, `ChatGPT ${name}: ${w.percent.toFixed(0)}% used`, w.percent >= 100 ? "error" : "warning");
-      }
-    }
   };
-  pollChatGpt();
-  setInterval(pollChatGpt, CONFIG.providerCheckIntervalMs);
+  void pollChatGpt();
+  addInterval(() => { void pollChatGpt(); }, CONFIG.providerCheckIntervalMs);
 
   // TokenRhythm 账户数据轮询（需要浏览器会话 Cookie，未配置时跳过）
   const tokenRhythmCookie = readTokenRhythmCookie(opts);
@@ -1025,13 +885,13 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
       data.providerUsage["tokenrhythm"] = pu;
       markDirty();
     };
-    pollTokenRhythm();
-    setInterval(pollTokenRhythm, CONFIG.providerCheckIntervalMs);
+    void pollTokenRhythm();
+    addInterval(() => { void pollTokenRhythm(); }, CONFIG.providerCheckIntervalMs);
   }
 
-  const cleanupInterval = setInterval(() => {
-    if (trackedCosts.size > 10000) trackedCosts.clear();
+  addInterval(() => {
     if (trackedResponses.size > 10000) trackedResponses.clear();
+    if (responseStates.size > 10000) responseStates.clear();
     const go = data.providerUsage["opencode-go"];
     if (go?.recentEvents && go.recentEvents.length > 100) {
       const sixHours = 6 * 60 * 60 * 1000;
@@ -1042,131 +902,217 @@ const UsagePlugin: Plugin = async (ctx, rawOptions) => {
     }
   }, 3600000);
 
-  const cleanup = () => {
-    clearInterval(saveTimer);
-    clearInterval(cleanupInterval);
+  const addProviderCost = (providerID: string, cost: number, timestamp: number) => {
+    if (!Number.isFinite(cost) || cost <= 0) return;
+    const pu = data.providerUsage[providerID] || { cost: 0, lastChecked: new Date().toISOString() };
+    pu.cost = (pu.cost || 0) + cost;
+    pu.lastChecked = new Date(timestamp).toISOString();
+    if (providerID === "opencode-go") {
+      pu.dailyCosts ??= {};
+      const day = new Date(timestamp).toISOString().slice(0, 10);
+      pu.dailyCosts[day] = (pu.dailyCosts[day] || 0) + cost;
+      pu.recentEvents ??= [];
+      pu.recentEvents.push({ time: timestamp, cost });
+      if (pu.recentEvents.length > 1000) {
+        const old = Date.now() - 6 * 60 * 60 * 1000;
+        pu.recentEvents = pu.recentEvents.filter((event) => event.time >= old);
+      }
+      pu.goWindows = calculateGoWindows(pu);
+    }
+    data.providerUsage[providerID] = pu;
+  };
+
+  const updateSessionUsage = (event: any) => {
+    const usage = event?.data;
+    const sessionID = typeof usage?.sessionID === "string" ? usage.sessionID : undefined;
+    if (!sessionID) return;
+
+    // session.usage.updated contains the cumulative usage for a session. The
+    // event does not carry a model reference, so keep the model selected by
+    // session.created/session.model.selected/session.step.started above.
+    const providerID = sessionModels.get(sessionID) || "unknown";
+
+    const currentCost = Number(usage.cost);
+    const previousCost = sessionCosts.get(sessionID) || 0;
+    if (Number.isFinite(currentCost) && currentCost >= previousCost) {
+      sessionCosts.set(sessionID, currentCost);
+      addProviderCost(providerID, currentCost - previousCost, finiteTimestamp(event.created) ?? Date.now());
+    }
+
+    const tokens = usage.tokens;
+    if (tokens && typeof tokens === "object") {
+      const currentTokens = [tokens.input, tokens.output, tokens.reasoning]
+        .map(Number)
+        .filter(Number.isFinite)
+        .reduce((sum, value) => sum + value, 0);
+      const previousTokens = sessionTokens.get(sessionID) || 0;
+      if (currentTokens >= previousTokens) {
+        sessionTokens.set(sessionID, currentTokens);
+        const pu = data.providerUsage[providerID] || { lastChecked: new Date().toISOString() };
+        pu.totalTokens = (pu.totalTokens || 0) + currentTokens - previousTokens;
+        data.providerUsage[providerID] = pu;
+      }
+    }
+    markDirty();
+  };
+
+  const updateResponseFromStep = (event: any) => {
+    const usage = event?.data;
+    const sessionID = typeof usage?.sessionID === "string" ? usage.sessionID : undefined;
+    const messageID = typeof usage?.assistantMessageID === "string" ? usage.assistantMessageID : undefined;
+    if (!sessionID || !messageID) return;
+
+    const state = ensureResponseState(messageID, sessionID);
+    state.providerID ??= sessionModels.get(sessionID);
+    const outputTokens = Number(usage.tokens?.output);
+    if (Number.isFinite(outputTokens) && outputTokens >= 0) {
+      state.outputTokens = outputTokens;
+    }
+    state.completedAt = finiteTimestamp(event.created) ?? Date.now();
+    recordResponseMetrics(messageID);
+  };
+
+  const finalizeSessionResponses = (sessionID: string, completedAt: number) => {
+    for (const [messageID, state] of responseStates) {
+      if (state.sessionID !== sessionID || trackedResponses.has(messageID)) continue;
+      state.completedAt = completedAt;
+      recordResponseMetrics(messageID);
+    }
+  };
+
+  const handleEvent = (event: any) => {
+    const today = ensureTodayStats(data);
+    const payload = event?.data ?? event?.properties ?? {};
+    const timestamp = finiteTimestamp(event?.created) ?? Date.now();
+
+    switch (event?.type) {
+      case "session.created":
+        today.sessions++;
+        if (payload.model?.providerID) sessionModels.set(payload.sessionID, payload.model.providerID);
+        markDirty();
+        break;
+      case "session.model.selected":
+        if (payload.sessionID && payload.model?.providerID) sessionModels.set(payload.sessionID, payload.model.providerID);
+        break;
+      case "session.step.started": {
+        const messageID = payload.assistantMessageID;
+        const sessionID = payload.sessionID;
+        if (sessionID && payload.model?.providerID) sessionModels.set(sessionID, payload.model.providerID);
+        if (messageID && sessionID) {
+          const state = ensureResponseState(messageID, sessionID);
+          state.providerID = payload.model?.providerID || sessionModels.get(sessionID);
+          state.createdAt = finiteTimestamp(payload.started) ?? timestamp;
+        }
+        break;
+      }
+      case "session.text.delta":
+        if (payload.assistantMessageID && typeof payload.delta === "string" && payload.delta.length > 0) {
+          const state = ensureResponseState(payload.assistantMessageID, payload.sessionID);
+          state.firstTokenAt ??= timestamp;
+        }
+        break;
+      case "session.text.ended":
+        if (payload.assistantMessageID) ensureResponseState(payload.assistantMessageID, payload.sessionID);
+        break;
+      case "session.step.ended":
+        updateResponseFromStep(event);
+        break;
+      case "session.step.failed":
+        updateResponseFromStep(event);
+        break;
+      case "session.usage.updated":
+        updateSessionUsage(event);
+        break;
+      case "session.execution.succeeded":
+      case "session.execution.failed":
+      case "session.execution.interrupted":
+      case "session.idle":
+        if (payload.sessionID) finalizeSessionResponses(payload.sessionID, timestamp);
+        if (event.type === "session.execution.failed") today.errors++;
+        markDirty();
+        break;
+      case "filesystem.changed":
+        today.filesEdited++;
+        markDirty();
+        break;
+      case "tui.toast.show":
+        today.toastsShown++;
+        markDirty();
+        break;
+      case "tui.prompt.append":
+        today.promptAppends++;
+        markDirty();
+        break;
+      case "tui.command.execute":
+        today.commandsExecuted++;
+        markDirty();
+        break;
+    }
+  };
+
+  const controller = new AbortController();
+  void (async () => {
+    try {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        handleEvent(event);
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) console.error("oc-plugin-usage event stream stopped", error);
+    }
+  })();
+
+  await ctx.tool.hook("execute.after", (event) => {
+    const today = ensureTodayStats(data);
+    const name = event.tool || "unknown";
+    today.toolCalls[name] = (today.toolCalls[name] ?? 0) + 1;
+    markDirty();
+  });
+
+  await ctx.tool.transform((editor) => {
+    editor.add({
+      name: "usage_stats",
+      description:
+        "Get AI model usage statistics including session counts, tool usage, file edits, " +
+        "response latency, output speed, and provider API costs. Call this when the user asks about usage, consumption, tokens, costs, or quotas.",
+      input: {
+        type: "object",
+        properties: {
+          period: {
+            type: "string",
+            enum: ["today", "week", "month", "rolling", "all"],
+            description: "Time period for aggregation",
+          },
+        },
+        additionalProperties: false,
+      },
+      async execute(input) {
+        const requested = (input as { period?: string })?.period;
+        const period: Period = ["today", "week", "month", "rolling", "all"].includes(requested || "")
+          ? requested as Period
+          : "today";
+        const stats = aggregate(data, period);
+        const parts: string[] = [
+          "╔══════════════════════════════════╗",
+          "║     AI Model Usage Report        ║",
+          "╚══════════════════════════════════╝",
+          "",
+          formatStats(stats, period),
+        ];
+        for (const [pid, pu] of Object.entries(data.providerUsage)) {
+          parts.push("", formatProviderUsage(pu, DISPLAY_NAMES[pid] || pid));
+        }
+        parts.push("", `Last updated: ${data.lastUpdated}`);
+        return { content: parts.join("\n") };
+      },
+    });
+  });
+
+  return () => {
+    controller.abort();
+    for (const timer of intervals) clearInterval(timer);
     saveData(dataFile, data);
   };
-  process.on("exit", cleanup);
-
-  return {
-    event: async ({ event }: { event: Event }) => {
-      const today = ensureTodayStats(data);
-      switch (event.type) {
-        case "session.created":
-          today.sessions++;
-          tryShowToast(ctx, "新会话已开始 ✨");
-          markDirty();
-          break;
-        case "session.error":
-          today.errors++;
-          markDirty();
-          break;
-        case "file.edited":
-          today.filesEdited++;
-          markDirty();
-          break;
-        case "tui.toast.show":
-          today.toastsShown++;
-          markDirty();
-          break;
-        case "tui.prompt.append":
-          today.promptAppends++;
-          markDirty();
-          break;
-        case "tui.command.execute":
-          today.commandsExecuted++;
-          markDirty();
-          break;
-        case "message.updated": {
-          const msg = (event as any).properties.info;
-          updateResponseMessage(msg);
-          if (msg?.role === "assistant" && typeof msg.cost === "number" && msg.cost > 0 && !trackedCosts.has(msg.id)) {
-            trackedCosts.add(msg.id);
-            const pid = msg.providerID || "unknown";
-            if (!data.providerUsage[pid]) {
-              data.providerUsage[pid] = { cost: 0, lastChecked: new Date().toISOString() };
-            }
-            data.providerUsage[pid].cost = (data.providerUsage[pid].cost || 0) + msg.cost;
-            data.providerUsage[pid].lastChecked = new Date().toISOString();
-
-            if (pid === "opencode-go") {
-              const go = data.providerUsage[pid];
-              if (!go.dailyCosts) go.dailyCosts = {};
-              const day = todayKey();
-              go.dailyCosts[day] = (go.dailyCosts[day] || 0) + msg.cost;
-              if (!go.recentEvents) go.recentEvents = [];
-              go.recentEvents.push({ time: Date.now(), cost: msg.cost });
-              if (go.recentEvents.length > 1000) {
-                const sixHours = 6 * 60 * 60 * 1000;
-                const old = Date.now() - sixHours;
-                go.recentEvents = go.recentEvents.filter(e => e.time >= old);
-              }
-              go.goWindows = calculateGoWindows(go);
-            }
-
-            if (data.providerUsage[pid].goWindows) {
-              const gw = data.providerUsage[pid].goWindows!;
-              for (const [name, w] of Object.entries({ "Rolling 5h": gw.rolling5h, Weekly: gw.weekly, Monthly: gw.monthly })) {
-                if (w.limit > 0) {
-                  const pct = (w.cost / w.limit) * 100;
-                  if (crossedThreshold(`go.${name}`, pct, readThresholdFile())) {
-                    await notifyThreshold(ctx as any, `${DISPLAY_NAMES[pid] || pid} ${name}`, pct, w.cost, w.limit);
-                  }
-                }
-              }
-            } else if (data.providerUsage[pid].limit != null && data.providerUsage[pid].limit > 0) {
-              const pct = ((data.providerUsage[pid].cost || 0) / data.providerUsage[pid].limit) * 100;
-              if (crossedThreshold(`cost.${pid}`, pct, readThresholdFile())) {
-                await notifyThreshold(ctx as any, DISPLAY_NAMES[pid] || pid, pct, data.providerUsage[pid].cost || 0, data.providerUsage[pid].limit);
-              }
-            }
-            markDirty();
-          }
-          break;
-        }
-        case "message.part.updated": {
-          const properties = (event as any).properties;
-          recordFirstResponseToken(properties?.part, properties?.delta);
-          break;
-        }
-      }
-    },
-    "tool.execute.after": async (input: { tool?: string }) => {
-      const today = ensureTodayStats(data);
-      const name = input.tool ?? "unknown";
-      today.toolCalls[name] = (today.toolCalls[name] ?? 0) + 1;
-      markDirty();
-    },
-    tool: {
-      usage_stats: tool({
-        description:
-          "Get AI model usage statistics including session counts, tool usage, file edits, " +
-          "response latency, output speed, and provider API costs. Call this when the user asks about usage, consumption, tokens, costs, or quotas.",
-        args: {
-          period: tool.schema
-            .enum(["today", "week", "month", "rolling", "all"])
-            .describe("Time period for aggregation"),
-        },
-        async execute(args: { period?: Period }) {
-          const period = args.period ?? "today";
-          const stats = aggregate(data, period);
-          const parts: string[] = [
-            "╔══════════════════════════════════╗",
-            "║     AI Model Usage Report        ║",
-            "╚══════════════════════════════════╝",
-            "",
-            formatStats(stats, period),
-          ];
-          for (const [pid, pu] of Object.entries(data.providerUsage)) {
-            parts.push("", formatProviderUsage(pu, DISPLAY_NAMES[pid] || pid));
-          }
-          parts.push("", `Last updated: ${data.lastUpdated}`);
-          return parts.join("\n");
-        },
-      }),
-    },
-  };
-};
+  },
+});
 
 export default UsagePlugin;

@@ -6,10 +6,11 @@ AI model usage monitoring plugin for [opencode](https://opencode.ai). Tracks ses
 
 ## Features
 
+- **Follows the active model** — the sidebar shows exactly one provider: the one in use. Picking a model in `/models` switches it immediately: OpenCode only persists the choice on the next prompt, so the plugin follows `~/.local/state/opencode/model.json` to switch right away
 - **Session cache hit rate** — live `cache read / (input + read)` for the current session (Hit rate, Input, Read, Write)
 - **Response speed** — tracks time to first token (TTFT) and output throughput (Tokens/s); the sidebar shows current-session averages, while `usage_stats` shows persisted totals
 - **Go plan usage** — official API percent windows (rolling 5h / weekly / monthly) with reset countdown
-- **ChatGPT usage** — reads `wham/usage` and `wham/usage/credit-usage-events` from the ChatGPT backend for plan type, 5h/weekly rate-limit windows, remaining Credits, and the same 7-day Codex/Work Credits totals shown by Codex Cloud Analytics. Works with the standard OpenAI OAuth login — no API key needed; the access token is refreshed automatically
+- **ChatGPT usage** — reads `wham/usage` and `wham/usage/credit-usage-events` from the ChatGPT backend for plan type, rate-limit windows (5h / weekly / monthly, picked from `limit_window_seconds` so whichever windows the account has are labelled correctly), remaining Credits, and the same 7-day Codex/Work Credits totals shown by Codex Cloud Analytics. Works with the standard OpenAI OAuth login — no API key needed; the plugin reads the credential from OpenCode V2's credential store and never refreshes the one-time OpenAI refresh token itself
 - **TokenRhythm account** — when the active provider is `tokenrhythm`, shows the actual available balance (实际可用总额) and cumulative cost (累计成本) from tokenrhythm.studio — the same numbers as the account page. Requires a browser session cookie (see below)
 - **DeepSeek balance** — when the active provider is `deepseek`, shows total, recharged, and granted balance from the DeepSeek balance API
 - **Provider quota (optional)** — connects to OpenAI/Anthropic billing APIs for real cost and limit data
@@ -19,6 +20,34 @@ AI model usage monitoring plugin for [opencode](https://opencode.ai). Tracks ses
 
 ## Install
 
+### One-command install (recommended)
+
+After cloning the repository, run:
+
+```bash
+./install.sh
+```
+
+The installer installs dependencies, registers the local package with an
+absolute path, backs up existing configuration files before changing them, and
+is safe to run repeatedly. OpenCode V2 automatically loads the package's
+`./tui` export for the sidebar. Use Chinese labels with:
+
+```bash
+./install.sh --language zh
+```
+
+To remove the registration later without deleting usage data:
+
+```bash
+./install.sh --uninstall
+```
+
+Use `./install.sh --help` for `--dry-run`, `--skip-deps`, and custom config
+directory options.
+
+> This checkout targets the OpenCode V2 plugin API.
+
 ### 1. Clone / copy the plugin
 
 ```bash
@@ -26,50 +55,40 @@ git clone git@github.com:JackyMao1999/oc-plugin-useage.git
 # or copy the folder anywhere, e.g. ~/.opencode/plugins/oc-plugin-usage
 ```
 
-Install dependencies (for local development / `tsc`):
+Install dependencies (the one-command installer does this automatically):
 
 ```bash
 cd oc-plugin-usage
 npm install
-npx tsc   # optional, only if you edit the source
+npx tsc   # optional typecheck/build
 ```
 
-### 2. Register the server plugin (opencode.json)
+### 2. Register the plugin (opencode.json)
 
-**Important:** use the absolute path to `src/index.ts`. Do **NOT** use the bare
-name `"oc-plugin-usage"` — that resolves to an unrelated npm package, not this
-plugin.
+Use the absolute path to the cloned package directory. Do **NOT** use the bare
+name `"oc-plugin-usage"` unless the package has been published and installed
+from npm.
 
 Global config (`~/.config/opencode/opencode.json`, or `~/.opencode/opencode.json`):
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["/path/to/oc-plugin-usage/src/index.ts"]
+  "plugins": [
+    {
+      "package": "/path/to/oc-plugin-useage-sidebar",
+      "options": {
+        "language": "en"
+      }
+    }
+  ]
 }
 ```
 
-### 3. Register the sidebar (TUI) plugin (tui.json)
+`language` accepts `"en"` (default) or `"zh"`. No separate `tui.json` or
+`cli.json` entry is needed: OpenCode V2 loads the package's `./tui` export.
 
-Create `~/.config/opencode/tui.json` (or `~/.opencode/tui.json`):
-
-```json
-{
-  "plugin": ["/path/to/oc-plugin-usage/src/tui.tsx"]
-}
-```
-
-Optional: set the sidebar language to Chinese with the tuple form:
-
-```json
-{
-  "plugin": [["/path/to/oc-plugin-usage/src/tui.tsx", { "language": "zh" }]]
-}
-```
-
-`language` accepts `"en"` (default) or `"zh"`.
-
-### 4. Restart opencode
+### 3. Restart opencode
 
 Plugins load only at startup. Quit and run `opencode` again — the right sidebar
 will show **Usage → Session Cache → Providers**.
@@ -94,11 +113,15 @@ require the workspace ID or a browser cookie.
 
 ```json
 {
-  "plugin": [["/path/to/oc-plugin-usage/src/index.ts", {
-    "openaiApiKey": "sk-...",
-    "anthropicApiKey": "sk-ant-...",
-    "usageThresholdPercent": 80
-  }]]
+  "plugins": [{
+    "package": "/path/to/oc-plugin-useage-sidebar",
+    "options": {
+      "openaiApiKey": "sk-...",
+      "anthropicApiKey": "sk-ant-...",
+      "usageThresholdPercent": 80,
+      "language": "en"
+    }
+  }]
 }
 ```
 
@@ -133,9 +156,10 @@ file. Alternatively pass the cookie via the `tokenrhythmCookie` plugin option.
 | Event | Tracks |
 |-------|--------|
 | `session.created` | session count |
-| `session.error` | error count |
+| `session.execution.failed` | error count |
 | `tool.execute.after` | tool call frequency (per tool name) |
-| `file.edited` | file modification count |
+| `filesystem.changed` | file modification count |
+| `session.usage.updated` | cumulative cost and token usage |
 
 Provider data (when configured): cost, token count, plan limit, remaining quota. Response speed is captured from the first streamed text part through assistant completion; throughput is calculated as output tokens divided by the time from first token to completion.
 
@@ -155,7 +179,7 @@ The tool accepts a `period` parameter: `today`, `week`, `month`, `rolling`, or `
 ~/.opencode/oc-plugin-usage-data.json
 ```
 
-Aggregated by calendar day. Provider data updated every 5 minutes when API keys are configured.
+Aggregated by calendar day. Provider data is refreshed every minute when API keys are configured.
 
 ## Build
 

@@ -7,7 +7,7 @@
  *   展示 AI 模型的使用统计数据（会话数、工具调用、费用等）。
  *
  * 它是怎么被加载的：
- *   在 tui.json 中配置了这个文件的路径后，opencode 启动时会自动加载并运行它。
+ *   OpenCode V2 通过插件包的 "./tui" 导出自动加载并运行它。
  *
  * 和 index.ts（Server 插件）的关系：
  *   - index.ts  负责"收集数据"：监听事件，把用量写入 JSON 文件
@@ -35,9 +35,8 @@
 /** @jsxImportSource @opentui/solid */
 
 // -------- 导入 OpenCode TUI 插件需要的类型 --------
-// TuiPlugin   : TUI 插件函数的标准类型（用来写 async (api) => { ... } 的函数签名）
-// TuiPluginModule : 插件模块的导出格式（必须导出 { id, tui } 这样的对象）
-import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
+// Plugin.define : OpenCode V2 CLI 插件的标准定义方式
+import { Plugin } from "@opencode/plugin/tui"
 
 // -------- 导入 SolidJS 的核心功能 --------
 // createSignal : 创建一个"可变化的值"（类似 React 的 useState）
@@ -56,7 +55,7 @@ import { createSignal, createMemo, createEffect, For, Show, onCleanup } from "so
 // readFileSync : 同步读取文件内容（返回字符串或 Buffer）
 // existsSync   : 检查文件是否存在（返回 true/false）
 // writeFileSync : 同步写入文件
-import { readFileSync, writeFileSync, existsSync } from "fs"
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs"
 
 // join         : 拼接文件路径（跨平台兼容）
 //               例：join("/home/user", ".opencode", "data.json") → "/home/user/.opencode/data.json"
@@ -95,6 +94,7 @@ function readThresholdFile(): number {
 // 写入用量提醒阈值（%）
 function writeThresholdFile(percent: number) {
   try {
+    mkdirSync(join(homedir(), ".opencode"), { recursive: true })
     writeFileSync(CONFIG_FILE, JSON.stringify({ usageThresholdPercent: percent }, null, 2))
   } catch {
     // 写入失败时静默忽略（下次调整时重试）
@@ -138,11 +138,18 @@ function crossedThreshold(key: string, pct: number, threshold: number): boolean 
 //   assistant 的 providerID 是实际传输层 provider，不能作为模型归属
 function getActiveProviderId(api: any, sessionId?: string): string | undefined {
   if (!api?.state?.ready || !sessionId) return undefined
+  api.state.revision?.()
   try {
+    // 首选：当前会话记录的 model（session.switchModel 会立刻更新这里）
+    const selected = api.state.session.model?.(sessionId)
+    if (selected?.providerID) return selected.providerID
+    // 回退：从最近的消息里找。V2 的消息没有 role 字段，用 type 判断；
+    // model-switched 是切换模型时插入的，assistant 是实际产生回复的模型。
     const msgs = api.state.session.messages(sessionId)
     for (let i = msgs.length - 1; i >= 0; i--) {
       const info = msgs[i]?.info ?? msgs[i]
-      if (info.role === "user" && info.model?.providerID) {
+      const type = info?.type ?? info?.role
+      if ((type === "model-switched" || type === "assistant" || type === "user") && info.model?.providerID) {
         return info.model.providerID
       }
     }
@@ -175,13 +182,16 @@ interface GoWindows {
   monthly: GoWindow
 }
 
-// GoApiWindow: 官方 /zen/go/v1/usage API 返回的时间窗口
-//   percent  : 已用百分比（和 opencode.ai 工作台一致）
-//   resetsAt : 重置时间（ISO 格式）
+// GoApiWindow: 官方 /zen/go/v1/usage API 或 ChatGPT wham/usage 返回的时间窗口
+//   percent       : 已用百分比（和 opencode.ai 工作台 / ChatGPT 后台一致）
+//   resetsAt      : 重置时间（ISO 格式）
+//   windowSeconds : 窗口长度（秒）。ChatGPT 的 primary/secondary 窗口粒度不固定
+//                   （18000=5h、604800=7d、2592000=30d），标签由它推导
 interface GoApiWindow {
   status?: string
   percent: number
   resetsAt?: string
+  windowSeconds?: number
 }
 
 // GoApiUsage: 官方 API 的三个窗口汇总
@@ -193,8 +203,8 @@ interface GoApiUsage {
 }
 
 // ChatGptUsage: ChatGPT (chatgpt.com) 用量 —— 来自 backend-api/wham/usage
-//   primary   : 5 小时窗口
-//   secondary : 每周窗口
+//   primary   : 主窗口（5 小时 / 每周 / 月度，取决于 windowSeconds）
+//   secondary : 次窗口（部分账号没有）
 //   credits   : 剩余 Credits
 interface ChatGptUsage {
   planType?: string
@@ -331,8 +341,8 @@ const DISPLAY_NAMES: Record<string, string> = {
 // 国际化（i18n）
 // ============================================================================
 
-// 界面语言：可通过 tui.json 的插件选项配置，例如：
-//   { "plugin": [["/path/to/oc-plugin-usage/src/tui.tsx", { "language": "zh" }]] }
+// 界面语言：通过 opencode.json 的插件 options 配置，例如：
+//   { "plugins": [{ "package": "...", "options": { "language": "zh" } }] }
 type Lang = "en" | "zh"
 
 interface Strings {
@@ -346,9 +356,11 @@ interface Strings {
   ttft: string
   tokensPerSecond: string
   noTurns: string
+  noData: string
   providers: string
   noneConfigured: string
   rolling5h: string
+  daily: string
   weekly: string
   monthly: string
   resets: string
@@ -397,9 +409,11 @@ function makeStrings(lang: Lang): Strings {
         ttft: "首字延迟",
         tokensPerSecond: "输出速度",
         noTurns: "暂无助手回复",
+        noData: "暂无用量数据",
         providers: "提供商",
         noneConfigured: "未配置",
         rolling5h: "最近5小时",
+        daily: "24小时",
         weekly: "本周",
         monthly: "本月",
         resets: "重置",
@@ -446,9 +460,11 @@ function makeStrings(lang: Lang): Strings {
         ttft: "TTFT",
         tokensPerSecond: "Tokens/s",
         noTurns: "No assistant turns yet",
+        noData: "No usage data yet",
         providers: "Providers",
         noneConfigured: "None configured",
         rolling5h: "Rolling 5h",
+        daily: "24h",
         weekly: "Weekly",
         monthly: "Monthly",
         resets: "Resets",
@@ -486,6 +502,20 @@ function makeStrings(lang: Lang): Strings {
       }
 }
 
+// windowLabel: 按窗口长度（秒）选择标签 —— 5 小时 / 24 小时 / 每周 / 每月。
+// OpenAI 的 wham/usage 用同一组 primary/secondary 字段返回不同粒度的窗口：
+// 免费/企业账号只给一个 30 天的月度窗口（2592000s），Plus/Pro 给 5h（18000s）+ 每周。
+// 写死 "最近5小时 / 本周" 会把月度窗口显示成 5 小时，所以这里按实际长度判断。
+function windowLabel(w: GoApiWindow, t: Strings): string {
+  const s = w.windowSeconds
+  if (!s || !Number.isFinite(s)) return t.rolling5h
+  if (s <= 6 * 3600) return t.rolling5h
+  if (s <= 2 * 86400) return t.daily
+  if (s <= 10 * 86400) return t.weekly
+  if (s <= 45 * 86400) return t.monthly
+  return `${Math.round(s / 86400)}d`
+}
+
 // ============================================================================
 // 热门提供商元数据（品牌色徽标 + 图标字符，模拟 logo 效果）
 // ============================================================================
@@ -511,6 +541,21 @@ const PROVIDER_META: ProviderMeta[] = [
   { id: "tokenrhythm", name: "TokenRhythm", color: "#06b6d4", glyph: "⬢" },
 ]
 
+// OpenTUI themes in OpenCode V2 use nested semantic tokens. Keep the
+// component code below readable by exposing the small compatibility palette it
+// needs in one place.
+function legacyTheme(theme: any) {
+  return {
+    text: theme?.text?.base ?? theme?.text,
+    textMuted: theme?.text?.muted ?? theme?.textMuted,
+    accent: theme?.text?.action?.primary?.base ?? theme?.accent ?? theme?.text?.base,
+    success: theme?.text?.feedback?.success?.base ?? theme?.success,
+    warning: theme?.text?.feedback?.warning?.base ?? theme?.warning,
+    error: theme?.text?.feedback?.error?.base ?? theme?.error,
+    borderSubtle: theme?.border?.base ?? theme?.borderSubtle,
+  }
+}
+
 
 // ============================================================================
 // UsageSidebar 组件 — 侧边栏的核心 UI
@@ -531,7 +576,7 @@ const PROVIDER_META: ProviderMeta[] = [
  *     ▼ Providers     ← OpenAI/Anthropic/Go/Zen 的费用和进度条
  */
 function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
-  // t : 当前语言的界面文案（en 或 zh，由 tui.json 的 language 选项控制）
+  // t : 当前语言的界面文案（en 或 zh，由插件 options.language 控制）
   const t = makeStrings(props.lang ?? "en")
 
   // -------- 响应式状态（SolidJS 的 createSignal） --------
@@ -550,86 +595,19 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   const [openCache, setOpenCache] = createSignal(true)    // Session Cache 区域（默认展开）
   const [openProviders, setOpenProviders] = createSignal(true) // Providers 区域（默认展开）
 
-  // goApi：官方 /zen/go/v1/usage API 的实时数据（每 1 分钟刷新）
-  const [goApi, setGoApi] = createSignal<GoApiUsage | null>(null)
+  // 所有 provider 用量都由服务端插件（index.ts）采集后写进 JSON 文件：
+  //   Go / Zen 套餐 → providerUsage["opencode-go"].goApi
+  //   DeepSeek 余额 → providerUsage.deepseek.deepseek
+  //   ChatGPT 限额 → providerUsage.openai.chatgpt
+  // V2 的凭证存放在 opencode.db，TUI 进程读不到，所以这里不再自己带 key 请求接口
+  // （旧版从 auth.json 取 key，在 V2 下该文件不存在，永远拉不到数据）。
 
-  // goUpdated：最近一次成功拉取官方 API 的时间戳（用于"更新"显示）
-  const [goUpdated, setGoUpdated] = createSignal<number | null>(null)
-
-  const [deepSeekUsage, setDeepSeekUsage] = createSignal<DeepSeekUsage | null>(null)
-
-  async function refreshDeepSeekBalance() {
-    try {
-      const authPath = join(homedir(), ".local", "share", "opencode", "auth.json")
-      if (!existsSync(authPath)) return
-      const auth = JSON.parse(readFileSync(authPath, "utf-8"))
-      const key = auth.deepseek?.key
-      if (typeof key !== "string" || !key) return
-      const resp = await fetch("https://api.deepseek.com/user/balance", {
-        headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
-      })
-      if (!resp.ok) return
-      const json = await resp.json() as any
-      const balance = Array.isArray(json?.balance_infos) ? json.balance_infos[0] : null
-      if (!balance) return
-      const numberOrUndefined = (value: unknown) => {
-        const n = Number(value)
-        return Number.isFinite(n) ? n : undefined
-      }
-      setDeepSeekUsage({
-        totalBalance: numberOrUndefined(balance.total_balance),
-        grantedBalance: numberOrUndefined(balance.granted_balance),
-        toppedUpBalance: numberOrUndefined(balance.topped_up_balance),
-        currency: typeof balance.currency === "string" ? balance.currency : "CNY",
-        isAvailable: typeof json.is_available === "boolean" ? json.is_available : undefined,
-        lastChecked: new Date().toISOString(),
-      })
-    } catch {
-      // 网络错误或 key 无效时回退到数据文件里的缓存
-    }
-  }
-  refreshDeepSeekBalance()
-  const deepSeekTimer = setInterval(refreshDeepSeekBalance, 60000)
-  onCleanup(() => clearInterval(deepSeekTimer))
-
-  // threshold：用量提醒阈值（%），从配置文件读取；每 30 秒随数据一起刷新
+  // threshold：用量提醒阈值（%），从配置文件读取；随数据一起刷新
   const [threshold, setThreshold] = createSignal(readThresholdFile())
 
   // thresholdKeyHint：调整阈值的快捷键提示
   //  Ctrl+O 在任意终端都有独立编码，不会被系统/终端拦截（Ctrl+Shift+U 在 Ubuntu/GNOME 被占用）
   const thresholdKeyHint = "Ctrl+O"
-
-  // 直接调用官方 API（和 opencode.ai 工作台 /go 页面相同的数据源）
-  // 无需 workspace ID 或浏览器 cookie，用 auth.json 里的 Go API key 即可
-  async function refreshGoApi() {
-    try {
-      const authPath = join(homedir(), ".local", "share", "opencode", "auth.json")
-      if (!existsSync(authPath)) return
-      const auth = JSON.parse(readFileSync(authPath, "utf-8"))
-      const key = auth["opencode-go"]?.key
-      if (!key) return
-      const resp = await fetch("https://opencode.ai/zen/go/v1/usage", {
-        headers: { Authorization: `Bearer ${key}` },
-      })
-      if (!resp.ok) return
-      const json = await resp.json()
-      const u = json?.usage
-      if (u?.rolling && u?.weekly && u?.monthly) {
-        setGoApi({
-          rolling: { status: u.rolling.status, percent: u.rolling.percent, resetsAt: u.rolling.resetsAt },
-          weekly: { status: u.weekly.status, percent: u.weekly.percent, resetsAt: u.weekly.resetsAt },
-          monthly: { status: u.monthly.status, percent: u.monthly.percent, resetsAt: u.monthly.resetsAt },
-          lastChecked: new Date().toISOString(),
-        })
-        setGoUpdated(Date.now())
-      }
-    } catch {
-      // 网络错误或 key 无效时静默失败，回退到 JSON 文件里的数据
-    }
-  }
-  refreshGoApi()
-  const goApiTimer = setInterval(refreshGoApi, 60000)
-  onCleanup(() => clearInterval(goApiTimer))
 
   // -------- 主题 --------
   // theme() 返回当前主题对象，包含各种颜色定义
@@ -639,16 +617,15 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   //     theme().success    → 成功/安全色（绿色系）
   //     theme().warning    → 警告色（黄色系）
   //     theme().error      → 错误色（红色系）
-  const theme = () => props.api.theme.current
+  const theme = () => legacyTheme(props.api.theme.current)
 
   // -------- 定时刷新 --------
-  // setInterval: 每隔 30000 毫秒（30 秒）执行一次
-  //   执行时调用 loadData() 重新读取文件，然后用 setData() 更新状态
-  //   setData() 更新后，所有依赖 data() 的 UI 都会自动刷新
+  // 每 5 秒重新读取一次 JSON 文件（服务端插件也是每 5 秒落盘），
+  // 让切换供应商后的新数据尽快出现。
   const timer = setInterval(() => {
     setData(loadData())
     setThreshold(readThresholdFile())
-  }, 30000)
+  }, 5000)
 
   // onCleanup: 当组件被销毁时（比如切换到其他页面），清除定时器
   //   这很重要！如果不清理，定时器会永远运行，造成内存泄漏
@@ -662,18 +639,20 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   // providers : 所有 Provider 的用量数据
   const providers = createMemo(() => data().providerUsage)
 
-  // readAuthKeys: 从 auth.json 读取哪些 provider 已经登录
-  //   API key 型：有 key 字段就算已配置
-  //   OAuth 型（如 openai 的 ChatGPT 登录）：有 refresh token 就算已配置
-  const readAuthKeys = (): Record<string, boolean> => {
+  // readConfiguredProviders: 哪些 provider 已经登录 —— 走 V2 的数据层。
+  // V2 把凭证放进 opencode.db，插件只能通过 data.location.integration 看到
+  // 「某个 integration 是否有可用连接」，看不到密钥本身（也不需要）。
+  const readConfiguredProviders = (): Record<string, boolean> => {
     try {
-      const authPath = join(homedir(), ".local", "share", "opencode", "auth.json")
-      if (!existsSync(authPath)) return {}
-      const auth = JSON.parse(readFileSync(authPath, "utf-8"))
+      const connected = new Set<string>(
+        ((props.api.state.integrations?.() ?? []) as any[])
+          .filter((i) => (i.connections ?? []).length > 0)
+          .map((i) => String(i.id)),
+      )
       const out: Record<string, boolean> = {}
-      for (const [id, v] of Object.entries(auth)) {
-        const entry = v as any
-        out[id] = Boolean(entry?.key) || (entry?.type === "oauth" && Boolean(entry?.refresh))
+      for (const id of connected) out[id] = true
+      for (const p of props.api.state.providers?.() ?? []) {
+        if (connected.has(p.integrationID ?? p.id)) out[p.id] = true
       }
       return out
     } catch {
@@ -691,7 +670,7 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
     const id = activeProviderId()
     if (!id) return []
     const puMap = providers()
-    const keys = readAuthKeys()
+    const keys = readConfiguredProviders()
     const meta = PROVIDER_META.find((m) => m.id === id)
     return [
       {
@@ -706,13 +685,23 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
     ]
   })
 
-  // goUsage : 优先用官方 API 的实时数据，其次用 JSON 文件里缓存的 goApi，都没有才回退 goWindows
-  const goUsage = createMemo(() => {
-    const live = goApi()
-    if (live) return live
-    const pu = providers()["opencode-go"]
-    if (pu?.goApi) return pu.goApi
-    return null
+  // goUsage : 服务端插件写入的官方 /zen/go/v1/usage 快照，没有才回退到本地累计的 goWindows
+  const goUsage = createMemo(() => providers()["opencode-go"]?.goApi ?? null)
+
+  // goUpdated : 这份快照的采集时间，用于"更新"显示
+  const goUpdated = createMemo(() => {
+    const checked = providers()["opencode-go"]?.goApi?.lastChecked
+    const at = checked ? new Date(checked).getTime() : NaN
+    return Number.isFinite(at) ? at : null
+  })
+
+  // 切换供应商（换模型）后立刻重新读取数据文件，不用等轮询，
+  // 这样侧边栏 / 状态栏马上切换到新供应商的用量。
+  createEffect(() => {
+    // 告诉 adapter 当前在看的会话：/models 里新选的模型都归属到它
+    props.api.state.session.view?.(props.sessionId)
+    activeProviderId()
+    setData(loadData())
   })
 
   // cacheStats : 当前会话的缓存统计
@@ -724,6 +713,7 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   const cacheStats = createMemo(() => {
     const stats = { input: 0, output: 0, read: 0, write: 0, turns: 0, hit: 0 }
     if (!props.api.state?.ready || !props.sessionId) return stats
+    props.api.state.revision?.()
     try {
       const msgs = props.api.state.session.messages(props.sessionId)
       for (const m of msgs) {
@@ -747,6 +737,7 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   const responseStats = createMemo(() => {
     const stats = { turns: 0, ttftMs: 0, outputTokens: 0, generationMs: 0 }
     if (!props.api.state?.ready || !props.sessionId) return stats
+    props.api.state.revision?.()
     const timestamp = (value: unknown): number | undefined => {
       const n = Number(value)
       return Number.isFinite(n) && n >= 0 ? n : undefined
@@ -755,7 +746,7 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
       const msgs = props.api.state.session.messages(props.sessionId)
       for (const raw of msgs) {
         const msg = raw as any
-        if (msg.role !== "assistant") continue
+        if (msg.role !== "assistant" && msg.type !== "assistant") continue
         const createdAt = timestamp(msg.time?.created)
         if (createdAt == null) continue
         const parts = props.api.state.part(msg.id) ?? []
@@ -912,8 +903,8 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   // ProviderDetails: 某个 provider 的用量明细
   //   Go：官方 API 三窗口进度条；其他：费用/剩余/Token 数
   const ProviderDetails = (id: string, pu?: ProviderUsage) => {
-    // DeepSeek：优先用 TUI 实时拉取的余额，其次用数据文件里的缓存
-    const ds = id === "deepseek" ? (deepSeekUsage() ?? pu?.deepseek) : undefined
+    // DeepSeek 余额由服务端插件轮询后写入数据文件
+    const ds = id === "deepseek" ? pu?.deepseek : undefined
     return (
     <box paddingLeft={2}>
       <Show when={id === "opencode-go" && goUsage()}>
@@ -938,9 +929,9 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
         <Show when={pu!.chatgpt!.planType}>
           {InfoRow(t.plan, pu!.chatgpt!.planType!.charAt(0).toUpperCase() + pu!.chatgpt!.planType!.slice(1))}
         </Show>
-        {GoWindowPercent(t.rolling5h, pu!.chatgpt!.primary)}
+        {GoWindowPercent(windowLabel(pu!.chatgpt!.primary, t), pu!.chatgpt!.primary)}
         <Show when={pu!.chatgpt!.secondary}>
-          {GoWindowPercent(t.weekly, pu!.chatgpt!.secondary!)}
+          {GoWindowPercent(windowLabel(pu!.chatgpt!.secondary!, t), pu!.chatgpt!.secondary!)}
         </Show>
         <Show when={pu!.chatgpt!.credits != null}>
           {InfoRow(t.balance, fmtCredits(pu!.chatgpt!.credits!))}
@@ -1066,9 +1057,13 @@ return (
                       {p.active ? t.inUse : p.configured ? t.configured : t.notConfigured}
                     </text>
                   </box>
-                  {/* 当前使用的提供商显示明细（Go 有实时 API，DeepSeek 有实时余额，其余看数据文件） */}
-                  <Show when={p.pu || (p.id === "opencode-go" && goUsage()) || (p.id === "deepseek" && deepSeekUsage())}>
+                  {/* 当前使用的提供商显示明细（数据来自服务端插件写入的 JSON 文件） */}
+                  <Show when={p.pu || (p.id === "opencode-go" && goUsage())}>
                     {ProviderDetails(p.id, p.pu)}
+                  </Show>
+                  {/* 切换到这个供应商但还没有采集到用量时给个明确提示，避免看起来像"没切换" */}
+                  <Show when={!p.pu && !(p.id === "opencode-go" && goUsage())}>
+                    <text fg={theme().textMuted} paddingLeft={2}>{t.noData}</text>
                   </Show>
                 </box>
               )}
@@ -1120,8 +1115,8 @@ async function checkAllAlerts(api: any, data: UsageData, t: Strings, threshold: 
         }
       }
     } else if (pid === "openai" && pu.chatgpt) {
-      const windows: Record<string, GoApiWindow> = { [t.rolling5h]: pu.chatgpt.primary }
-      if (pu.chatgpt.secondary) windows[t.weekly] = pu.chatgpt.secondary
+      const windows: Record<string, GoApiWindow> = { [windowLabel(pu.chatgpt.primary, t)]: pu.chatgpt.primary }
+      if (pu.chatgpt.secondary) windows[windowLabel(pu.chatgpt.secondary, t)] = pu.chatgpt.secondary
       for (const [wname, w] of Object.entries(windows)) {
         if (crossedThreshold(`chatgpt.${wname}`, w.percent, threshold)) {
           alerts.push({ name: `${name} ${wname}`, pct: w.percent })
@@ -1158,7 +1153,7 @@ async function checkAllAlerts(api: any, data: UsageData, t: Strings, threshold: 
 }
 
 // UsageStatusBar: 侧边栏底部常驻状态栏 —— 常驻显示当前提供商的用量 + 阈值
-//   - 注册在 sidebar_footer 槽位（single_winner，order 50 赢得内置插件）
+//   - 注册在 V2 的 sidebar.footer 槽位
 //   - 固定在侧边栏底部，不随内容滚动；每 30 秒重新读取数据文件，
 //     同时检查所有提供商是否跨越阈值 → 系统通知（api.attention.notify）
 //   - 右侧保留内置 footer 原本的 目录: 分支 信息
@@ -1166,15 +1161,22 @@ function UsageStatusBar(props: { api: any; sessionId?: string; lang: Lang }) {
   const t = makeStrings(props.lang ?? "en")
   const [data, setData] = createSignal(loadData())
   const [threshold, setThreshold] = createSignal(readThresholdFile())
-  const theme = () => props.api.theme.current
+  const theme = () => legacyTheme(props.api.theme.current)
 
   const timer = setInterval(() => {
     setData(loadData())
     setThreshold(readThresholdFile())
-  }, 30000)
+  }, 5000)
   onCleanup(() => clearInterval(timer))
 
   const activeId = createMemo(() => getActiveProviderId(props.api, props.sessionId))
+
+  // 切换供应商后立刻重读数据文件，状态栏马上跟随新供应商
+  createEffect(() => {
+    props.api.state.session.view?.(props.sessionId)
+    activeId()
+    setData(loadData())
+  })
 
   // 当前提供商的所有用量窗口（用于状态栏显示最大百分比）
   const windows = createMemo(() => {
@@ -1187,8 +1189,10 @@ function UsageStatusBar(props: { api: any; sessionId?: string; lang: Lang }) {
       out.push({ name: t.weekly, pct: pu.goApi.weekly.percent })
       out.push({ name: t.monthly, pct: pu.goApi.monthly.percent })
     } else if (id === "openai" && pu?.chatgpt) {
-      out.push({ name: t.rolling5h, pct: pu.chatgpt.primary.percent })
-      if (pu.chatgpt.secondary) out.push({ name: t.weekly, pct: pu.chatgpt.secondary.percent })
+      out.push({ name: windowLabel(pu.chatgpt.primary, t), pct: pu.chatgpt.primary.percent })
+      if (pu.chatgpt.secondary) {
+        out.push({ name: windowLabel(pu.chatgpt.secondary, t), pct: pu.chatgpt.secondary.percent })
+      }
     } else if (pu?.cost != null && pu?.limit != null && pu.limit > 0) {
       out.push({ name: t.used, pct: (pu.cost / pu.limit) * 100 })
     }
@@ -1200,182 +1204,305 @@ function UsageStatusBar(props: { api: any; sessionId?: string; lang: Lang }) {
     checkAllAlerts(props.api, data(), t, threshold())
   })
 
-  const id = activeId()
-  if (id === undefined || windows().length === 0) return null
-
-  const meta = PROVIDER_META.find((m) => m.id === id)
-  const maxPct = Math.max(...windows().map((w) => w.pct))
-  const over = maxPct >= threshold()
-  const barColor = over ? (maxPct >= 100 ? theme().error : theme().warning) : theme().textMuted
-
   // 内置 footer 原本显示的 目录（分支在应用最底部栏已显示，这里只补目录名）
   const dir = props.api.state?.path?.directory
   const base = dir ? String(dir).split(/[\\/]/).pop() : undefined
 
   return (
-    <box flexDirection="row" gap={1}>
-      <text fg={meta?.color ?? "#94a3b8"}>{meta?.glyph ?? "●"}</text>
-      <text fg={theme().text}><b>{meta?.name ?? id}</b></text>
-      <text fg={barColor}>{fmtPct(maxPct)}%</text>
-      <text fg={theme().textMuted}>·{threshold()}%</text>
-      <box flexGrow={1} />
-      <text fg={theme().textMuted}>{base}</text>
-    </box>
+    <Show when={activeId() !== undefined && windows().length > 0}>
+      <box flexDirection="row" gap={1}>
+        <text fg={PROVIDER_META.find((m) => m.id === activeId())?.color ?? "#94a3b8"}>
+          {PROVIDER_META.find((m) => m.id === activeId())?.glyph ?? "●"}
+        </text>
+        <text fg={theme().text}>
+          <b>{PROVIDER_META.find((m) => m.id === activeId())?.name ?? activeId()}</b>
+        </text>
+        <text fg={
+          Math.max(...windows().map((w) => w.pct)) >= threshold()
+            ? Math.max(...windows().map((w) => w.pct)) >= 100 ? theme().error : theme().warning
+            : theme().textMuted
+        }>
+          {fmtPct(Math.max(...windows().map((w) => w.pct)))}%
+        </text>
+        <text fg={theme().textMuted}>·{threshold()}%</text>
+        <box flexGrow={1} />
+        <text fg={theme().textMuted}>{base}</text>
+      </box>
+    </Show>
   )
 }
 
 
 // ============================================================================
-// 插件注册 — 这是 opencode 加载插件的入口
+// V2 TUI adapter
 // ============================================================================
 
-/**
- * tui: TUI 插件函数
- *
- * 当 opencode 启动时，会调用这个函数，传入 api 对象。
- * api 提供了 opencode 的各种功能：
- *   - api.slots.register() : 注册 UI 插槽（把组件挂到侧边栏/标题栏等位置）
- *   - api.theme            : 主题（颜色配置）
- *   - api.state            : opencode 的状态（会话列表等）
- *   - api.client           : SDK 客户端（可以调用 API）
- *   - api.kv               : 键值存储（持久化小数据）
- *   - api.keymap           : 快捷键管理
- *   - api.lifecycle        : 生命周期管理（onDispose 等）
- */
-const tui: TuiPlugin = async (api, options) => {
-  // 语言选项：tui.json 里用元组形式配置
-  //   { "plugin": [["/path/to/oc-plugin-usage/src/tui.tsx", { "language": "zh" }]] }
-  // 支持 "zh"（中文）或 "en"（英文，默认）
-  const opts = (options || {}) as { language?: string }
-  const lang: Lang = opts.language === "zh" ? "zh" : "en"
-  const t = makeStrings(lang)
+// 在 /models 里选模型时，opencode 只把选择存在 TUI 进程内存里，要等下一次
+// 发消息才会调用 session.switchModel 落库（POST /api/session/:id/model）。
+// 所以只读会话数据的话，侧边栏要等到你发出下一条消息才会跟着换供应商。
+// 但选模型的同时 opencode 会把这个模型写到
+//   ~/.local/state/opencode/model.json 的 recent[0]（addRecent）
+// 这里监听这个文件：发现 recent[0] 变了，就认为"刚刚在当前查看的会话里选了它"，
+// 侧边栏立刻跟随；等这个模型真的落库（或超时）后自动清除。
+const MODEL_STATE_FILE = join(homedir(), ".local", "state", "opencode", "model.json")
 
-  // 调整提醒阈值的对话框（Ctrl+O 或命令面板触发）
-  const DialogPrompt = api.ui.DialogPrompt
-  function openThresholdDialog() {
-    const current = readThresholdFile()
-    api.ui.dialog.replace(
-      () => (
-        <DialogPrompt
-          title={t.setThresholdTitle}
-          description={() => (
-            <text fg={api.theme.current.textMuted}>{t.setThresholdDesc(current)}</text>
-          )}
-          placeholder="10-100"
-          value={String(current)}
-          onConfirm={(v) => {
-            const n = Math.round(Number(v))
-            if (Number.isFinite(n) && n >= 1 && n <= 100) {
-              writeThresholdFile(n)
-              api.ui.toast({ variant: "success", message: t.thresholdSet(n) })
-            } else {
-              api.ui.toast({ variant: "error", message: t.invalidThreshold })
-            }
-            api.ui.dialog.clear()
-          }}
-          onCancel={() => api.ui.dialog.clear()}
-        />
-      ),
-      () => {},
-    )
+// 选了却没发消息时，最多按这个时长当"当前选择"，之后回落到服务端记录
+const MODEL_PICK_TTL_MS = 5 * 60 * 1000
+
+interface ModelPick {
+  providerID: string
+  modelID?: string
+  at: number
+}
+
+/**
+ * createModelPickTracker 监听 model.json，把"刚选的模型"暂存到当前查看的会话上。
+ * 单独抽成函数（并导出 file 参数）是为了能脱离 TUI 单独测试。
+ */
+export function createModelPickTracker(
+  readPersistedModel: (sessionID: string) => { id?: string; providerID?: string } | undefined,
+  onChange?: () => void,
+  file: string = MODEL_STATE_FILE,
+) {
+  const picked = new Map<string, ModelPick>()
+  let viewing: string | undefined
+  let lastHead: string | undefined
+  let initialized = false
+
+  const readHead = (): { providerID: string; modelID?: string } | undefined => {
+    try {
+      if (!existsSync(file)) return undefined
+      const recent = JSON.parse(readFileSync(file, "utf-8"))?.recent
+      const head = Array.isArray(recent) ? recent[0] : undefined
+      if (!head || typeof head.providerID !== "string") return undefined
+      return {
+        providerID: head.providerID,
+        modelID: typeof head.modelID === "string" ? head.modelID : undefined,
+      }
+    } catch {
+      return undefined
+    }
   }
 
-  // 调整提醒阈值的命令（命令面板 Ctrl+P 可搜到；回车触发）
-  // 用 v1 兼容的 api.command.register —— 保证命令出现在命令面板
-  api.command?.register(() => [
-    {
-      title: lang === "zh" ? "设置用量提醒阈值" : "Set usage alert threshold",
-      value: "oc-plugin-usage.set-threshold",
-      description: lang === "zh" ? `当前 ${readThresholdFile()}%` : `Current ${readThresholdFile()}%`,
-      category: "Usage",
-      onSelect: () => openThresholdDialog(),
-    },
-  ])
+  const refresh = () => {
+    const head = readHead()
+    const key = head ? `${head.providerID}/${head.modelID ?? ""}` : undefined
+    if (!initialized) {
+      // 首次只记基线：不知道这条 recent 是不是当前会话选的
+      initialized = true
+      lastHead = key
+    } else if (key !== lastHead) {
+      // recent[0] 变了 → 刚刚发生了选择（改 variant 不会改 recent[0]，不会误判）
+      lastHead = key
+      if (head && viewing) {
+        picked.set(viewing, { ...head, at: Date.now() })
+        onChange?.()
+      }
+    }
 
-  // 快捷键层：Ctrl+O 触发同一个对话框（终端不支持组合键时可用命令面板）
-  // 注意：keymap 的修饰键只有 ctrl/shift/meta/super/hyper，没有 alt
-  try {
-    api.keymap.registerLayer({
-      commands: [
-        {
-          name: "oc-plugin-usage.set-threshold",
-          title: lang === "zh" ? "设置用量提醒阈值" : "Set usage alert threshold",
-          category: "Usage",
-          run: () => openThresholdDialog(),
+    const now = Date.now()
+    for (const [sessionID, pick] of picked) {
+      const persisted = readPersistedModel(sessionID)
+      const applied = persisted?.providerID === pick.providerID && persisted.id === pick.modelID
+      if (applied || now - pick.at > MODEL_PICK_TTL_MS) {
+        picked.delete(sessionID)
+        onChange?.()
+      }
+    }
+  }
+
+  return {
+    // 记录当前正在查看的会话（新选择都归属到它）
+    view: (sessionID?: string) => { viewing = sessionID },
+    refresh,
+    model: (sessionID: string) => {
+      const pick = picked.get(sessionID)
+      if (!pick) return undefined
+      return { id: pick.modelID, providerID: pick.providerID }
+    },
+  }
+}
+
+/**
+ * The V2 TUI API keeps session data in context.data. The components above
+ * intentionally use a tiny local view of that data, so they can stay focused
+ * on rendering instead of transport details.
+ */
+function createTuiApi(context: any) {
+  const [revision, setRevision] = createSignal(0)
+  const messageSessions = new Map<string, string>()
+  const partTimes = new Map<string, { start?: number; end?: number }>()
+
+  const persistedModel = (sessionID: string) => context.data.session.get(sessionID)?.model
+  const modelPicks = createModelPickTracker(persistedModel, () => setRevision((value) => value + 1))
+  modelPicks.refresh()
+  const modelPickTimer = setInterval(() => modelPicks.refresh(), 2000)
+
+  const stopListening = context.data.listen(({ details }: { details: any }) => {
+    const event = details
+    const payload = event?.data
+    if (!payload?.assistantMessageID) {
+      if (event?.type === "session.created" || event?.type === "session.model.selected") setRevision((value) => value + 1)
+      return
+    }
+    const key = `${payload.assistantMessageID}:${payload.ordinal ?? 0}`
+    if (event.type === "session.text.started") {
+      partTimes.set(key, { start: Number(event.created) })
+    } else if (event.type === "session.text.delta" && typeof payload.delta === "string" && payload.delta.length > 0) {
+      const time = partTimes.get(key) ?? {}
+      time.start ??= Number(event.created)
+      partTimes.set(key, time)
+    } else if (event.type === "session.text.ended") {
+      const time = partTimes.get(key) ?? {}
+      time.end = Number(event.created)
+      partTimes.set(key, time)
+    }
+    setRevision((value) => value + 1)
+  })
+
+  const messages = (sessionID: string) => {
+    const list = context.data.session.message.list(sessionID) ?? []
+    for (const message of list) messageSessions.set(message.id, sessionID)
+    return list
+  }
+
+  const parts = (messageID: string) => {
+    const sessionID = messageSessions.get(messageID)
+    if (!sessionID) return []
+    const message = context.data.session.message.get(sessionID, messageID) as any
+    const content = Array.isArray(message?.content) ? message.content : []
+    let textOrdinal = 0
+    return content.map((part: any) => {
+      if (part?.type !== "text") return part
+      const time = partTimes.get(`${messageID}:${textOrdinal++}`)
+      return time ? { ...part, time } : part
+    })
+  }
+
+  // V2 的 provider / integration 缓存在 context.data.location 里，先同步一次再读，
+  // 这样「当前 provider 是否已登录」不用去读 auth.json（V2 已经没有该文件）。
+  const location = context.location ?? context.data.location.default()
+  void context.data.location.provider.sync(location)
+  void context.data.location.integration.sync(location)
+
+  const api = {
+    get theme() {
+      return { current: context.theme }
+    },
+    state: {
+      get ready() {
+        return true
+      },
+      get revision() {
+        return revision
+      },
+      path: { directory: context.location?.directory },
+      session: {
+        messages,
+        // 先读会话记录（保持响应式跟踪），再用"刚选的模型"覆盖：
+        // 选模型的瞬间就会变，不用等下一次发消息落库。
+        model: (sessionID: string) => {
+          const persisted = persistedModel(sessionID)
+          return modelPicks.model(sessionID) ?? persisted
         },
-      ],
-    })
-  } catch {
-    // 命令层注册失败不影响命令面板入口
-  }
-  try {
-    api.keymap.registerLayer({
-      bindings: [{ key: "ctrl+o", cmd: "oc-plugin-usage.set-threshold" }],
-    })
-  } catch {
-    // 绑定键解析失败（终端不支持）时忽略
-  }
-
-  // api.slots.register() : 注册一个"插槽插件"
-  // 插槽 = opencode 界面上的特定位置（比如侧边栏、Logo 区域等）
-  // 你可以在这些位置插入自定义的 UI 内容
-  api.slots.register({
-    /**
-     * order : 渲染顺序（数字越小越靠前）
-     *
-     * opencode 内置的侧边栏内容的顺序是：
-     *   100 : Context（上下文信息，token 数等）
-     *   200 : MCP（MCP 服务器状态）
-     *   300 : LSP（语言服务器状态）
-     *   400 : Todo（待办事项列表）
-     *   500 : Files（变更文件列表）
-     *
-     * 我们选择 150，让 Usage 面板显示在 Context（100）之后，MCP（200）之前
-     */
-    order: 150,
-
-    // slots : 你要在哪些插槽位置插入 UI
-    slots: {
-      /**
-       * sidebar_content : 侧边栏主体内容区域
-       *
-       * 这个函数在每次渲染侧边栏时被调用
-       * 返回的 JSX 会被渲染到这个位置
-       * props 包含当前会话的 session_id 等信息
-       */
-sidebar_content(_ctx, props) {
-        // props.session_id : 当前正在查看的会话 ID（用于计算该会话的缓存命中率）
-        return <UsageSidebar api={api} sessionId={props.session_id} lang={lang} />
+        view: modelPicks.view,
       },
+      part: parts,
+      providers: () => context.data.location.provider.list(location) ?? [],
+      integrations: () => context.data.location.integration.list(location) ?? [],
     },
-  })
+    client: context.client,
+    attention: context.attention,
+    ui: {
+      toast: (input: any) => context.ui.toast.show(input),
+    },
+  }
 
-  // sidebar_footer 是 single_winner 槽位：内置插件以 order 100 注册，
-  // 我们以 order 50 注册才能赢得它（否则显示不了常驻状态栏）
-  api.slots.register({
-    order: 50,
-    slots: {
-      sidebar_footer(_ctx, props) {
-        return <UsageStatusBar api={api} sessionId={props.session_id} lang={lang} />
-      },
-    },
-  })
+  const dispose = () => {
+    clearInterval(modelPickTimer)
+    stopListening()
+  }
+
+  return { api, dispose }
 }
 
-/**
- * plugin : 插件的导出对象
- *
- * opencode 要求 TUI 插件模块的默认导出是 { id, tui } 格式
- *   - id  : 插件的唯一标识符（用于日志、管理面板等）
- *   - tui : TUI 插件函数（上面定义的）
- *
- * TuiPluginModule 确保类型正确（导出格式符合 opencode 的要求）
- */
-const plugin: TuiPluginModule & { id: string } = {
-  id: "oc-plugin-usage-sidebar",
-  tui,
-}
+const TuiPlugin = Plugin.define({
+  id: "oc-plugin-usage.tui",
+  setup(context) {
+    const options = context.options as { language?: string }
+    const lang: Lang = options.language === "zh" ? "zh" : "en"
+    const configuredThreshold = Number((context.options as any).usageThresholdPercent)
+    if (!existsSync(CONFIG_FILE) && Number.isFinite(configuredThreshold) && configuredThreshold > 0 && configuredThreshold <= 100) {
+      writeThresholdFile(configuredThreshold)
+    }
+    const t = makeStrings(lang)
+    const { api, dispose: disposeApi } = createTuiApi(context)
 
-// 默认导出（ES Module 规范）
-// opencode 通过 import 加载这个文件时，拿到的就是这个对象
-export default plugin
+    const openThresholdDialog = async () => {
+      const current = readThresholdFile()
+      const value = await context.ui.dialog.prompt({
+        title: t.setThresholdTitle,
+        description: t.setThresholdDesc(current),
+        placeholder: "10-100",
+        value: String(current),
+      })
+      if (value === undefined) return
+      const n = Math.round(Number(value))
+      if (Number.isFinite(n) && n >= 1 && n <= 100) {
+        writeThresholdFile(n)
+        context.ui.toast.show({ variant: "success", message: t.thresholdSet(n) })
+      } else {
+        context.ui.toast.show({ variant: "error", message: t.invalidThreshold })
+      }
+    }
+
+    // Keymap layers are Solid component APIs in V2. Register this layer from
+    // an app slot render, where OpenCode has installed Keymap.Provider, rather
+    // than from setup() (which runs outside the component tree).
+    const unregisterApp = context.ui.slot({
+      append: "app",
+      render: () => {
+        context.keymap.layer(() => ({
+          mode: "global",
+          priority: 50,
+          commands: [
+            {
+              id: "oc-plugin-usage.set-threshold",
+              title: lang === "zh" ? "设置用量提醒阈值" : "Set usage alert threshold",
+              description: lang === "zh" ? `当前 ${readThresholdFile()}%` : `Current ${readThresholdFile()}%`,
+              group: "Usage",
+              bind: "ctrl+o",
+              palette: true,
+              run: () => { void openThresholdDialog() },
+            },
+          ],
+        }))
+        return null
+      },
+    })
+
+    // render 的入参是响应式对象：不要解构，直接把 input.sessionID 透传给组件，
+    // 这样切换会话时侧边栏会跟着重新绑定。
+    const unregisterContent = context.ui.slot({
+      append: "sidebar.content",
+      render: (input: { sessionID: string }) => (
+        <UsageSidebar api={api} sessionId={input.sessionID} lang={lang} />
+      ),
+    })
+    const unregisterFooter = context.ui.slot({
+      append: "sidebar.footer",
+      render: (input: { sessionID: string }) => (
+        <UsageStatusBar api={api} sessionId={input.sessionID} lang={lang} />
+      ),
+    })
+
+    return () => {
+      unregisterApp()
+      unregisterContent()
+      unregisterFooter()
+      disposeApi()
+    }
+  },
+})
+
+export default TuiPlugin
