@@ -13,6 +13,7 @@ AI model usage monitoring plugin for [opencode](https://opencode.ai). Tracks ses
 - **ChatGPT usage** — reads `wham/usage` and `wham/usage/credit-usage-events` from the ChatGPT backend for plan type, rate-limit windows (5h / weekly / monthly, picked from `limit_window_seconds` so whichever windows the account has are labelled correctly), remaining Credits, and the same 7-day Codex/Work Credits totals shown by Codex Cloud Analytics. Works with the standard OpenAI OAuth login — no API key needed; the plugin reads the credential from OpenCode V2's credential store and never refreshes the one-time OpenAI refresh token itself
 - **TokenRhythm account** — when the active provider is `tokenrhythm`, shows the actual available balance (实际可用总额) and cumulative cost (累计成本) from tokenrhythm.studio — the same numbers as the account page. Requires a browser session cookie (see below)
 - **DeepSeek balance** — when the active provider is `deepseek`, shows total, recharged, and granted balance from the DeepSeek balance API
+- **StepFun balance and Step Plan usage** — when the active provider is `stepfun` or `stepfun-step-plan`, shows the balance from StepFun's account API; with an account-page session configured, also shows the plan name, 5-hour / weekly / Credit usage windows, today's Credits and call counts
 - **Provider quota (optional)** — connects to OpenAI/Anthropic billing APIs for real cost and limit data
 - **AI callable** — the `usage_stats` tool lets the model report usage when asked
 - **Toast alerts** — warns at configurable threshold (default 80%) when approaching a provider limit
@@ -121,6 +122,7 @@ require the workspace ID or a browser cookie.
     "options": {
       "openaiApiKey": "sk-...",
       "anthropicApiKey": "sk-ant-...",
+      "stepfunApiKey": "sk-...",
       "usageThresholdPercent": 80,
       "language": "en"
     }
@@ -142,6 +144,42 @@ The site's session expires after ~24h idle; when that happens the sidebar
 shows a "cookie expired" hint and keeps the last values until you update the
 file. Alternatively pass the cookie via the `tokenrhythmCookie` plugin option.
 
+### StepFun balance and plan usage (optional)
+
+StepFun exposes the current account balance through an API-key authenticated endpoint, so no browser cookie is needed:
+
+```
+GET https://api.stepfun.com/v1/accounts
+Authorization: Bearer <StepFun API key>
+```
+
+The plugin first looks for a saved `stepfun`, `step`, or `stepfun-step-plan`
+provider key in OpenCode. You can also pass `stepfunApiKey`; values are
+displayed in CNY.
+
+**Step Plan usage** is separate from the API balance and can only be read from
+the account page's login-session endpoints — StepFun rejects API keys for them
+(403 `api key not permitted for this method`). The plugin calls these three in
+parallel:
+
+```
+POST https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/QueryStepPlanRateLimit  # 5-hour / weekly / subscription Credit left rates + reset times
+POST https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/QueryStepPlanUsages    # today's Credit consumption and call counts per model
+POST https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/GetStepPlanStatus      # plan name
+```
+
+The sidebar then shows the plan name, 5-hour / weekly / Credit usage bars (with
+reset countdowns), today's Credits, today's calls, and the API balance.
+
+To enable plan usage, copy the whole `Cookie` request header from a request made
+while logged in at `https://platform.stepfun.com/account-overview` into
+`~/.opencode/stepfun-cookie.txt` (the `Oasis-Token` cookie is the login
+session; pasting just that one value also works). The plugin reads the cookie on
+each poll, uses it only for these requests, and never writes it or the API key
+to the usage JSON. When the session expires the sidebar shows a "cookie expired"
+hint and keeps the last values until you update the file. You can alternatively
+pass the cookie as `stepfunCookie`.
+
 ## Options
 
 | Option | Type | Default | Description |
@@ -149,6 +187,8 @@ file. Alternatively pass the cookie via the `tokenrhythmCookie` plugin option.
 | `openaiApiKey` | `string` | — | OpenAI API key for billing usage queries |
 | `anthropicApiKey` | `string` | — | Anthropic API key for usage queries |
 | `deepseekApiKey` | `string` | — | DeepSeek API key for balance queries; falls back to `auth.json` |
+| `stepfunApiKey` | `string` | — | StepFun API key for account balance queries; falls back to the OpenCode credential store |
+| `stepfunCookie` | `string` | — | StepFun account-page session cookie for Step Plan usage; alternatively use `~/.opencode/stepfun-cookie.txt` |
 | `chatGptAccountId` | `string` | — | Optional ChatGPT workspace account ID; omit for a personal account |
 | `tokenrhythmCookie` | `string` | — | TokenRhythm session cookie (alternative to `~/.opencode/tokenrhythm-cookie.txt`) |
 | `usageThresholdPercent` | `number` | `80` | Percentage at which toast warning fires |

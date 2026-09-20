@@ -13,6 +13,7 @@
 - **ChatGPT 用量** — 读取 ChatGPT 后台的 `wham/usage` 和 `wham/usage/credit-usage-events`，显示计划类型、限额窗口（按 `limit_window_seconds` 自动识别 5 小时 / 每周 / 月度，账号有哪些窗口就显示哪些）、剩余 Credits，以及与 Codex Cloud Analytics 一致的近7天 Codex/Work Credits 汇总；用标准 OpenAI OAuth 登录即可，无需 API key。凭证直接读 OpenCode V2 的凭证存储，插件不会自己去刷 OpenAI 的一次性 refresh token（由 opencode 负责续期）
 - **TokenRhythm 账户** — 当前提供商为 `tokenrhythm` 时，侧边栏显示 tokenrhythm.studio 的**实际可用总额**和**累计成本**（与账户页同源数字）；需要浏览器会话 Cookie（见下文）
 - **DeepSeek 余额** — 当前提供商为 `deepseek` 时，通过 DeepSeek API key 显示总余额、充值余额和赠送余额；自动读取 OpenCode 登录保存的 key，也可手动配置
+- **StepFun 余额和 Step Plan 用量** — 当前提供商为 `stepfun` 或 `stepfun-step-plan` 时，通过官方账户 API 显示余额；配置账户页会话后，还会显示套餐名称、5 小时 / 每周 / Credit 三个用量窗口、今日 Credits 与调用次数（见下文）
 - **Provider 配额（可选）** — 连接 OpenAI/Anthropic 计费 API，显示真实费用和限额
 - **AI 可调用** — `usage_stats` 工具可让模型在收到询问时报告用量
 - **Toast 提醒** — 接近限额时弹出警告（默认阈值 80%）
@@ -113,6 +114,7 @@ Authorization: Bearer <opencode-go key>
       "openaiApiKey": "sk-...",
       "anthropicApiKey": "sk-ant-...",
       "deepseekApiKey": "sk-...",
+      "stepfunApiKey": "sk-...",
       "usageThresholdPercent": 80,
       "language": "zh"
     }
@@ -130,6 +132,38 @@ tokenrhythm.studio 的管理接口只认浏览器登录会话，`sk_tr_...` API 
 
 站点会话闲置约 24 小时后过期；过期后侧边栏会显示"Cookie 已过期"提示并保留最后一次数据，更新文件即可恢复。也可以通过 `tokenrhythmCookie` 插件选项传入。
 
+### 可选：StepFun 余额与套餐用量
+
+StepFun 官方提供了支持 API key 的账户余额接口，不需要账户页的浏览器 Cookie：
+
+```
+GET https://api.stepfun.com/v1/accounts
+Authorization: Bearer <stepfun API key>
+```
+
+插件会优先读取 OpenCode 已保存的 `stepfun`、`step` 或 `stepfun-step-plan`
+提供商 Key；也可以通过 `stepfunApiKey` 插件选项配置。返回的余额单位为人民币。
+
+**Step Plan 套餐用量**与 API 余额是两套数据，只能从账户页（platform.stepfun.com）
+的登录态接口读取——API key 调用会被拒绝（403 `api key not permitted for this
+method`），插件会并行请求下面三个接口：
+
+```
+POST https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/QueryStepPlanRateLimit  # 5 小时 / 每周 / 订阅 Credit 剩余比例与重置时间
+POST https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/QueryStepPlanUsages    # 今日按模型汇总的 Credit 消耗与调用次数
+POST https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/GetStepPlanStatus      # 套餐名称
+```
+
+侧边栏据此显示：套餐名称、最近5小时 / 本周 / Credit用量三个进度条（含重置倒计时）、
+今日已消耗 Credits、今日调用次数，以及 API 余额。
+
+要启用套餐用量，请在已登录 `https://platform.stepfun.com/account-overview` 时，
+从浏览器某个请求的 Request Headers 复制完整 `Cookie` 值到
+`~/.opencode/stepfun-cookie.txt`（Cookie 里的 `Oasis-Token` 即登录态，只复制这
+一条的值也可以）。插件每轮读取该文件，仅把 Cookie 用于本次查询，不会把 Cookie
+或 API key 写入用量 JSON；会话过期后侧边栏会提示"Cookie 已过期"并保留最后一次
+数据，重新复制即可。也可以通过 `stepfunCookie` 插件选项传入 Cookie。
+
 ## 配置项
 
 | 选项 | 类型 | 默认值 | 说明 |
@@ -137,6 +171,8 @@ tokenrhythm.studio 的管理接口只认浏览器登录会话，`sk_tr_...` API 
 | `openaiApiKey` | `string` | — | 用于查询账单用量的 OpenAI API key |
 | `anthropicApiKey` | `string` | — | 用于查询用量的 Anthropic API key |
 | `deepseekApiKey` | `string` | — | 用于查询 DeepSeek 余额的 API key；未配置时自动读取 `auth.json` |
+| `stepfunApiKey` | `string` | — | 用于查询 StepFun 账户余额的 API key；未配置时自动读取 OpenCode 凭证 |
+| `stepfunCookie` | `string` | — | 用于查询 Step Plan 套餐用量的账户页会话 Cookie；也可使用 `~/.opencode/stepfun-cookie.txt` |
 | `chatGptAccountId` | `string` | — | 可选的 ChatGPT 工作区账号 ID；个人账号无需配置 |
 | `tokenrhythmCookie` | `string` | — | TokenRhythm 会话 Cookie（也可用 `~/.opencode/tokenrhythm-cookie.txt` 文件） |
 | `usageThresholdPercent` | `number` | `80` | Toast 警告触发的用量百分比 |

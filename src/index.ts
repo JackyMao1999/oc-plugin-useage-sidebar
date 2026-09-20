@@ -103,6 +103,7 @@ interface ProviderUsage {
   chatgpt?: ChatGptUsage;
   tokenrhythm?: TokenRhythmUsage;
   deepseek?: DeepSeekUsage;
+  stepfun?: StepFunUsage;
   responseMetrics?: ResponseMetrics;
 }
 
@@ -128,6 +129,35 @@ interface DeepSeekUsage {
   toppedUpBalance?: number;
   currency?: string;
   isAvailable?: boolean;
+  lastChecked?: string;
+}
+
+// StepFun 账户余额 —— 来自官方 GET /v1/accounts API。
+// 该接口支持直接使用 API key，不需要账户页的浏览器 Cookie。
+interface StepFunUsage {
+  accountType?: string;
+  balance?: number;
+  currency?: string;
+  stepPlan?: StepFunPlanUsage;
+  lastChecked?: string;
+}
+
+// Step Plan 套餐用量 —— 全部来自账户页的登录态接口（API key 会被 403 拒绝）：
+//   QueryStepPlanRateLimit → 5 小时 / 每周 / 订阅 Credit 三个窗口的剩余比例与重置时间
+//   QueryStepPlanUsages   → 今日按模型汇总的 Credit 消耗与调用次数
+//   GetStepPlanStatus     → 套餐名称
+interface StepFunPlanUsage {
+  creditLeftRate?: number;    // 订阅 Credit 剩余比例（0~1）
+  creditResetTime?: string;   // 订阅 Credit 重置时间（ISO）
+  fiveHourLeftRate?: number;  // 5 小时窗口剩余比例（0~1）
+  fiveHourResetTime?: string; // 5 小时窗口重置时间（ISO）
+  weeklyLeftRate?: number;    // 每周窗口剩余比例（0~1）
+  weeklyResetTime?: string;   // 每周窗口重置时间（ISO）
+  creditUsed?: number;        // 今日已消耗 Credit（微 credit，前端展示时 /1e6）
+  calls?: number;             // 今日调用次数
+  planName?: string;          // 套餐名称（GetStepPlanStatus.subscription.name）
+  authExpired?: boolean;      // Cookie 失效（401），数据为旧值
+  notConfigured?: boolean;    // 还没配置 Cookie，读不到套餐用量
   lastChecked?: string;
 }
 
@@ -275,6 +305,9 @@ const INTEGRATION_IDS: Record<string, string[]> = {
   openai: ["openai"],
   anthropic: ["anthropic"],
   deepseek: ["deepseek"],
+  stepfun: ["stepfun", "stepfun-step-plan", "step"],
+  step: ["step", "stepfun-step-plan", "stepfun"],
+  "stepfun-step-plan": ["stepfun-step-plan", "stepfun", "step"],
   "opencode-go": ["opencode-go", "opencode", "opencode-zen", "zen"],
 };
 
@@ -306,9 +339,10 @@ function readLegacyCredential(providerID: string): ProviderCredential | null {
 
 // 读取某个 provider 的当前凭证：V2 优先，读不到再回退 auth.json。
 async function readCredential(ctx: any, providerID: string): Promise<ProviderCredential | null> {
+  const candidates = INTEGRATION_IDS[providerID] ?? [providerID];
   const connection = ctx?.integration?.connection;
   if (connection?.active && connection?.resolve) {
-    for (const integrationID of INTEGRATION_IDS[providerID] ?? [providerID]) {
+    for (const integrationID of candidates) {
       try {
         const active = await connection.active(integrationID);
         if (!active) continue;
@@ -319,7 +353,11 @@ async function readCredential(ctx: any, providerID: string): Promise<ProviderCre
       }
     }
   }
-  return readLegacyCredential(providerID);
+  for (const candidate of candidates) {
+    const legacy = readLegacyCredential(candidate);
+    if (legacy) return legacy;
+  }
+  return null;
 }
 
 function chatGptAccountHeaders(accountId?: string): Record<string, string> {
@@ -409,6 +447,41 @@ function readTokenRhythmCookie(opts: PluginOptions): string | null {
   return null;
 }
 
+// StepFun 账户页会话 Cookie：优先用插件选项 stepfunCookie，其次读
+// ~/.opencode/stepfun-cookie.txt。这里需要的是账户页请求的整个 Cookie 头，
+// 其中的 Oasis-Token 只在内存中转换成请求头，绝不写入用量数据文件。
+function readStepFunCookie(opts: PluginOptions): string | null {
+  const fromOption = opts.stepfunCookie?.trim();
+  if (fromOption) return fromOption;
+  try {
+    const cookieFile = join(homedir(), ".opencode", "stepfun-cookie.txt");
+    if (existsSync(cookieFile)) {
+      const cookie = readFileSync(cookieFile, "utf-8").trim();
+      if (cookie) return cookie;
+    }
+  } catch {
+    // 读取失败当作未配置
+  }
+  return null;
+}
+
+function cookieValue(cookie: string, name: string): string | undefined {
+  const wanted = name.toLowerCase();
+  for (const part of cookie.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0) continue;
+    if (part.slice(0, separator).trim().toLowerCase() !== wanted) continue;
+    const value = part.slice(separator + 1).trim();
+    if (!value) return undefined;
+    try {
+      return decodeURIComponent(value);
+    } catch {
+      return value;
+    }
+  }
+  return undefined;
+}
+
 // 查询 TokenRhythm 账户数据（钱包余额 + 用量汇总，和 /account/account 页面同源）。
 // 该站的管理 API 只认浏览器登录会话（Cookie），不支持 API key 认证。
 async function checkTokenRhythmUsage(cookie: string): Promise<TokenRhythmUsage | null> {
@@ -458,6 +531,9 @@ const DISPLAY_NAMES: Record<string, string> = {
   opencode: "Zen",
   "opencode-go": "opencode",
   tokenrhythm: "TokenRhythm",
+  stepfun: "StepFun",
+  step: "StepFun",
+  "stepfun-step-plan": "StepFun",
 };
 
 interface PluginOptions {
@@ -467,6 +543,8 @@ interface PluginOptions {
   chatGptAccountId?: string;
   tokenrhythmCookie?: string;
   deepseekApiKey?: string;
+  stepfunApiKey?: string;
+  stepfunCookie?: string;
   usageThresholdPercent?: number;
 }
 
@@ -649,6 +727,13 @@ function formatDurationMs(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
 }
 
+// Step Plan Credit 的展示单位与账户页一致：接口返回微 credit（1e6 = 1 credit），
+// 除以 1e6 后加 "M" 后缀，例如 2e8 → "200M"。
+function fmtStepCredits(value: number): string {
+  const millions = value / 1e6;
+  return `${millions.toLocaleString("en-US", { maximumFractionDigits: 1 })}M`;
+}
+
 // 由窗口长度推断标签：5 小时 / 24 小时 / 每周 / 每月。
 // OpenAI 的 wham/usage 用同一组 primary/secondary 字段返回不同粒度的窗口
 // （免费/企业账号是月度，Plus/Pro 是 5h + 每周），不能写死。
@@ -697,6 +782,27 @@ function formatProviderUsage(pu: ProviderUsage, label: string): string {
     if (ds.toppedUpBalance != null) lines.push(`  Recharged:  ${money(ds.toppedUpBalance)}`);
     if (ds.grantedBalance != null) lines.push(`  Granted:    ${money(ds.grantedBalance)}`);
     if (ds.isAvailable === false) lines.push(`  Note:       balance unavailable for API calls`);
+  }
+  if (pu.stepfun) {
+    const sf = pu.stepfun;
+    const money = (n: number) => `${n.toFixed(2)} ${sf.currency || "CNY"}`;
+    if (sf.stepPlan?.planName) lines.push(`  Plan:       ${sf.stepPlan.planName}`);
+    else if (sf.accountType) lines.push(`  Type:       ${sf.accountType}`);
+    const planWindow = (name: string, leftRate?: number, resetsAt?: string) => {
+      if (leftRate == null) return;
+      const used = (1 - Math.max(0, Math.min(1, leftRate))) * 100;
+      lines.push(`  ${name.padEnd(10)} ${used.toFixed(1)}% used${resetsAt ? ` (resets ${new Date(resetsAt).toLocaleString()})` : ""}`);
+    };
+    if (sf.stepPlan) {
+      planWindow("5h", sf.stepPlan.fiveHourLeftRate, sf.stepPlan.fiveHourResetTime);
+      planWindow("weekly", sf.stepPlan.weeklyLeftRate, sf.stepPlan.weeklyResetTime);
+      planWindow("credit", sf.stepPlan.creditLeftRate, sf.stepPlan.creditResetTime);
+      if (sf.stepPlan.creditUsed != null) lines.push(`  Credits:    ${fmtStepCredits(sf.stepPlan.creditUsed)} today`);
+      if (sf.stepPlan.calls != null) lines.push(`  Calls:      ${sf.stepPlan.calls} today`);
+      if (sf.stepPlan.authExpired) lines.push(`  Note:       account page cookie expired, showing stale data`);
+      if (sf.stepPlan.notConfigured) lines.push(`  Note:       account page cookie not configured`);
+    }
+    if (sf.balance != null) lines.push(`  Balance:    ${money(sf.balance)}`);
   }
   if (pu.goApi) {
     const fmt = (w: GoApiWindow) =>
@@ -813,6 +919,169 @@ async function checkDeepSeekBalance(apiKey: string): Promise<DeepSeekUsage | nul
   }
 }
 
+async function checkStepFunBalance(apiKey: string): Promise<StepFunUsage | null> {
+  try {
+    const resp = await fetch("https://api.stepfun.com/v1/accounts", {
+      headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+    });
+    if (!resp.ok) return null;
+    const json: any = await resp.json();
+    const num = (value: unknown): number | undefined => {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    const balance = num(json?.balance);
+    if (balance == null) return null;
+    return {
+      accountType: typeof json?.type === "string" ? json.type : undefined,
+      balance,
+      currency: "CNY",
+      lastChecked: new Date().toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function epochSecondsToIso(value: unknown): string | undefined {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  const milliseconds = n > 1e12 ? n : n * 1000;
+  const date = new Date(milliseconds);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
+}
+
+// 账户页（platform.stepfun.com）Connect RPC 接口的公共请求头。
+// 浏览器登录态在 Cookie 的 Oasis-Token 里，同时以 Oasis-Token 头发一份；
+// Oasis-Webid 可选，有就一起带上。
+function stepFunPlatformHeaders(cookie: string): Record<string, string> | null {
+  const cookieHeader = cookie.trim().replace(/^cookie\s*:\s*/i, "");
+  const token = cookieValue(cookieHeader, "Oasis-Token") || cookieHeader;
+  if (!token) return null;
+  const webId = cookieValue(cookieHeader, "Oasis-Webid");
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    Accept: "application/json",
+    "Oasis-appID": "10300",
+    "Oasis-Platform": "web",
+    "Oasis-Token": token,
+    Cookie: cookieHeader,
+  };
+  if (webId) headers["Oasis-Webid"] = webId;
+  return headers;
+}
+
+// POST 一个账户页 Dashboard 接口；网络异常返回 null，其余返回原始 Response
+// （调用方自己区分 401 / 其它错误 / 正常响应）。
+async function stepFunPlatformPost(cookie: string, method: string, body: unknown): Promise<Response | null> {
+  const headers = stepFunPlatformHeaders(cookie);
+  if (!headers) return null;
+  try {
+    return await fetch(`https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/${method}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+  } catch {
+    return null;
+  }
+}
+
+// protobuf JSON 映射里 int64 会序列化成字符串，数字字段统一走这里转换
+function numOrUndefined(value: unknown): number | undefined {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+// QueryStepPlanUsages 的默认时间范围就是"今天"（和账户页用量明细一致），
+// startTime/toTime 是毫秒（int64 → JSON 字符串）。
+function stepPlanTodayRange(): { startTime: string; toTime: string } {
+  const now = new Date();
+  const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return { startTime: String(midnight.getTime()), toTime: String(now.getTime()) };
+}
+
+// 查询 StepFun 账户页上的 Step Plan 套餐用量。
+// 这些是账户页自己调的登录态接口，不接受 StepFun API key（403
+// "api key not permitted for this method"）；API key 只能用于 /v1/accounts
+// 余额接口。三个接口并行请求，任一成功就不算失效：
+//   QueryStepPlanRateLimit → 5 小时 / 每周 / 订阅 Credit 剩余比例与重置时间
+//   QueryStepPlanUsages   → 今日 Credit 消耗与调用次数（credit_consumed 是
+//                            微 credit，账户页展示时 /1e6 加 "M" 后缀）
+//   GetStepPlanStatus     → 套餐名称
+// 响应字段来自 proto 的 JSON 映射，兼容 snake_case 与服务端网关版本差异。
+async function checkStepFunPlan(cookie: string): Promise<StepFunPlanUsage | null> {
+  const [rateLimitResp, usagesResp, statusResp] = await Promise.all([
+    stepFunPlatformPost(cookie, "QueryStepPlanRateLimit", {}),
+    stepFunPlatformPost(cookie, "QueryStepPlanUsages", { ...stepPlanTodayRange(), page: 1, pageSize: 100, granularHour: 1 }),
+    stepFunPlatformPost(cookie, "GetStepPlanStatus", {}),
+  ]);
+  const responses = [rateLimitResp, usagesResp, statusResp];
+  const anyOk = responses.some((resp) => resp?.ok);
+  // 全部 401 → Cookie 失效；数据为旧值，由展示层提示
+  if (!anyOk) {
+    if (responses.some((resp) => resp?.status === 401)) {
+      return { authExpired: true, lastChecked: new Date().toISOString() };
+    }
+    return null;
+  }
+
+  const out: StepFunPlanUsage = { lastChecked: new Date().toISOString() };
+
+  if (rateLimitResp?.ok) {
+    try {
+      const json: any = await rateLimitResp.json();
+      const source = json?.data && typeof json.data === "object" ? json.data : json;
+      const leftRate = (value: unknown): number | undefined => {
+        const n = numOrUndefined(value);
+        return n != null && n >= 0 ? Math.min(1, n) : undefined;
+      };
+      out.fiveHourLeftRate = leftRate(source?.fiveHourUsageLeftRate ?? source?.five_hour_usage_left_rate);
+      out.fiveHourResetTime = epochSecondsToIso(source?.fiveHourUsageResetTime ?? source?.five_hour_usage_reset_time);
+      out.weeklyLeftRate = leftRate(source?.weeklyUsageLeftRate ?? source?.weekly_usage_left_rate);
+      out.weeklyResetTime = epochSecondsToIso(source?.weeklyUsageResetTime ?? source?.weekly_usage_reset_time);
+      const rateLimit = source?.planCreditRateLimit ?? source?.plan_credit_rate_limit;
+      out.creditLeftRate = leftRate(rateLimit?.subscriptionCreditLeftRate ?? rateLimit?.subscription_credit_left_rate);
+      out.creditResetTime = epochSecondsToIso(rateLimit?.subscriptionCreditResetTime ?? rateLimit?.subscription_credit_reset_time);
+    } catch {
+      // 单个接口解析失败不影响其它字段
+    }
+  }
+
+  if (usagesResp?.ok) {
+    try {
+      const json: any = await usagesResp.json();
+      const source = json?.data && typeof json.data === "object" ? json.data : json;
+      const records = source?.records;
+      if (Array.isArray(records)) {
+        let creditUsed = 0;
+        let calls = 0;
+        for (const record of records) {
+          creditUsed += numOrUndefined(record?.creditConsumed ?? record?.credit_consumed) ?? 0;
+          calls += numOrUndefined(record?.calls) ?? 0;
+        }
+        out.creditUsed = creditUsed;
+        out.calls = calls;
+      }
+    } catch {
+      // 用量明细解析失败时保留窗口比例数据
+    }
+  }
+
+  if (statusResp?.ok) {
+    try {
+      const json: any = await statusResp.json();
+      const source = json?.data && typeof json.data === "object" ? json.data : json;
+      const name = source?.subscription?.name ?? source?.subscription?.planId;
+      if (typeof name === "string" && name) out.planName = name;
+    } catch {
+      // 套餐名称解析失败不影响用量数据
+    }
+  }
+
+  return out;
+}
+
 const UsagePlugin = Plugin.define({
   id: "oc-plugin-usage",
   async setup(ctx) {
@@ -886,6 +1155,62 @@ const UsagePlugin = Plugin.define({
     pollDeepSeek();
     addInterval(() => { void pollDeepSeek(); }, CONFIG.providerCheckIntervalMs);
   }
+
+  // StepFun 账户余额 + Step Plan 套餐用量轮询。每轮重新读取凭证和 Cookie，
+  // 支持用户在 OpenCode 中登录、切换 API key 或更新账户页会话后无需重启插件。
+  const stepFunProviderID = () =>
+    data.providerUsage["stepfun-step-plan"] && !data.providerUsage.stepfun && !data.providerUsage.step
+      ? "stepfun-step-plan"
+      : data.providerUsage.step && !data.providerUsage.stepfun
+        ? "step"
+        : "stepfun";
+
+  const pollStepFun = async () => {
+    const key = opts.stepfunApiKey || (await readCredential(ctx, "stepfun"))?.key;
+    const cookie = readStepFunCookie(opts);
+    const [usage, plan] = await Promise.all([
+      key ? checkStepFunBalance(key) : Promise.resolve(null),
+      cookie ? checkStepFunPlan(cookie) : Promise.resolve(null),
+    ]);
+    const providerID = stepFunProviderID();
+    const pu = data.providerUsage[providerID] || { lastChecked: new Date().toISOString() };
+    let stepfun = pu.stepfun || {};
+    let dirty = false;
+
+    if (usage) {
+      stepfun = { ...stepfun, ...usage };
+      dirty = true;
+    }
+    if (cookie) {
+      if (plan) {
+        const prev = stepfun.stepPlan ?? {};
+        const stepPlan: StepFunPlanUsage = { ...prev, ...plan };
+        if (!plan.authExpired) {
+          // 有新数据说明 Cookie 是好的，清掉之前的失效/未配置标记
+          stepPlan.authExpired = undefined;
+          stepPlan.notConfigured = undefined;
+        } else {
+          // 失效提示优先于未配置，避免两条提示同时出现
+          stepPlan.notConfigured = undefined;
+        }
+        stepfun = { ...stepfun, stepPlan, lastChecked: plan.lastChecked };
+        dirty = true;
+      }
+    } else if (!stepfun.stepPlan?.notConfigured) {
+      // 没配 Cookie：记一条"未配置"状态，侧边栏据此提示怎么配（已有旧数据仍保留）
+      stepfun = {
+        ...stepfun,
+        stepPlan: { ...stepfun.stepPlan, notConfigured: true, lastChecked: new Date().toISOString() },
+      };
+      dirty = true;
+    }
+    if (!dirty) return;
+    pu.stepfun = stepfun;
+    data.providerUsage[providerID] = pu;
+    markDirty();
+  };
+  void pollStepFun();
+  addInterval(() => { void pollStepFun(); }, CONFIG.providerCheckIntervalMs);
 
   const responseStates = new Map<string, ResponseState>();
   const trackedResponses = new Set<string>();

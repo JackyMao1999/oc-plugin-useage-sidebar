@@ -191,6 +191,18 @@ function fmtMoney(n: number, currency?: string): string {
   return !currency || currency === "CNY" ? `¥${v}` : `${v} ${currency}`
 }
 
+// fmtStepCredits: Step Plan Credit 格式化 —— 接口返回微 credit（1e6 = 1 credit），
+// 与账户页一致除以 1e6 后加 "M" 后缀，例如 2e8 → "200M"
+function fmtStepCredits(n: number): string {
+  const millions = n / 1e6
+  return `${millions.toLocaleString("en-US", { maximumFractionDigits: 1 })}M`
+}
+
+// leftRateToUsedPct: Step Plan 接口返回的是"剩余比例"（0~1），转成已用百分比
+function leftRateToUsedPct(leftRate: number): number {
+  return (1 - Math.max(0, Math.min(1, leftRate))) * 100
+}
+
 // 已提醒过的百分比（跨组件共享，状态栏组件负责检查）
 //   只在"跨越阈值"时提醒一次，避免每轮刷新都弹：
 //   1. 首次达到阈值 → 提醒
@@ -317,6 +329,7 @@ interface ProviderUsage {
   chatgpt?: ChatGptUsage                                   // ChatGPT 用量数据（wham/usage）
   tokenrhythm?: TokenRhythmUsage                           // TokenRhythm 账户数据（钱包 + 用量汇总）
   deepseek?: DeepSeekUsage                                  // DeepSeek 余额数据
+  stepfun?: StepFunUsage                                    // StepFun 余额数据
 }
 
 // TokenRhythmUsage: TokenRhythm（tokenrhythm.studio）账户数据
@@ -337,6 +350,29 @@ interface DeepSeekUsage {
   toppedUpBalance?: number
   currency?: string
   isAvailable?: boolean
+  lastChecked?: string
+}
+
+interface StepFunUsage {
+  accountType?: string
+  balance?: number
+  currency?: string
+  stepPlan?: StepFunPlanUsage
+  lastChecked?: string
+}
+
+interface StepFunPlanUsage {
+  creditLeftRate?: number    // 订阅 Credit 剩余比例（0~1）
+  creditResetTime?: string   // 订阅 Credit 重置时间（ISO）
+  fiveHourLeftRate?: number  // 5 小时窗口剩余比例（0~1）
+  fiveHourResetTime?: string // 5 小时窗口重置时间（ISO）
+  weeklyLeftRate?: number    // 每周窗口剩余比例（0~1）
+  weeklyResetTime?: string   // 每周窗口重置时间（ISO）
+  creditUsed?: number        // 今日已消耗 Credit（微 credit，展示时 /1e6）
+  calls?: number             // 今日调用次数
+  planName?: string          // 套餐名称
+  authExpired?: boolean      // Cookie 失效（401），数据为旧值
+  notConfigured?: boolean    // 还没配置 Cookie，读不到套餐用量
   lastChecked?: string
 }
 
@@ -418,6 +454,22 @@ const DISPLAY_NAMES: Record<string, string> = {
   anthropic: "Anthropic",
   opencode: "Zen",
   "opencode-go": "Go",
+  stepfun: "StepFun",
+  step: "StepFun",
+  "stepfun-step-plan": "StepFun",
+}
+
+const STEPFUN_PROVIDER_IDS = new Set(["stepfun", "step", "stepfun-step-plan"])
+function isStepFunProvider(providerID: string): boolean {
+  return STEPFUN_PROVIDER_IDS.has(providerID)
+}
+
+function providerUsageFor(providerUsage: Record<string, ProviderUsage>, providerID: string): ProviderUsage | undefined {
+  const direct = providerUsage[providerID]
+  if (!isStepFunProvider(providerID)) return direct
+  const fallback = providerUsage.stepfun ?? providerUsage.step ?? providerUsage["stepfun-step-plan"]
+  if (!direct || direct.stepfun || !fallback?.stepfun) return direct ?? fallback
+  return { ...direct, stepfun: fallback.stepfun }
 }
 
 // ============================================================================
@@ -470,6 +522,12 @@ interface Strings {
   deepseekRecharged: string
   deepseekGranted: string
   deepseekUnavailable: string
+  stepfunBalance: string
+  stepfunCreditUsage: string
+  stepfunCreditUsed: string
+  stepfunCalls: string
+  stepfunCookieExpired: string
+  stepfunCookieNotSet: string
   threshold: string
   adjustThreshold: string
   setThresholdTitle: string
@@ -524,6 +582,12 @@ function makeStrings(lang: Lang): Strings {
         deepseekRecharged: "充值余额",
         deepseekGranted: "赠送余额",
         deepseekUnavailable: "余额不可用于 API 调用",
+        stepfunBalance: "余额",
+        stepfunCreditUsage: "Credit用量",
+        stepfunCreditUsed: "今日Credits",
+        stepfunCalls: "今日调用",
+        stepfunCookieExpired: "Cookie 已过期，请更新 stepfun-cookie.txt",
+        stepfunCookieNotSet: "未配置 Cookie，无法读取套餐用量（见 README）",
         threshold: "提醒阈值",
         adjustThreshold: "调整阈值",
         setThresholdTitle: "设置用量提醒阈值 (%)",
@@ -576,6 +640,12 @@ function makeStrings(lang: Lang): Strings {
         deepseekRecharged: "Recharged",
         deepseekGranted: "Granted",
         deepseekUnavailable: "Balance unavailable for API calls",
+        stepfunBalance: "Balance",
+        stepfunCreditUsage: "Credit usage",
+        stepfunCreditUsed: "Credits today",
+        stepfunCalls: "Calls today",
+        stepfunCookieExpired: "Cookie expired, update stepfun-cookie.txt",
+        stepfunCookieNotSet: "Cookie not set, plan usage unavailable (see README)",
         threshold: "Alert threshold",
         adjustThreshold: "Adjust threshold",
         setThresholdTitle: "Set usage alert threshold (%)",
@@ -622,6 +692,9 @@ const PROVIDER_META: ProviderMeta[] = [
   { id: "codex", name: "Codex", color: "#64748b", glyph: "✦" },
   { id: "xai", name: "Grok", color: "#e2e8f0", glyph: "✧" },
   { id: "deepseek", name: "DeepSeek", color: "#4f46e5", glyph: "❖" },
+  { id: "stepfun", name: "StepFun", color: "#1677ff", glyph: "◆" },
+  { id: "step", name: "StepFun", color: "#1677ff", glyph: "◆" },
+  { id: "stepfun-step-plan", name: "StepFun", color: "#1677ff", glyph: "◆" },
   { id: "zhipuai", name: "GLM", color: "#2563eb", glyph: "❖" },
   { id: "siliconflow-cn", name: "SiliconFlow", color: "#0891b2", glyph: "❖" },
   { id: "tokenrhythm", name: "TokenRhythm", color: "#06b6d4", glyph: "⬢" },
@@ -684,6 +757,7 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   // 所有 provider 用量都由服务端插件（index.ts）采集后写进 JSON 文件：
   //   Go / Zen 套餐 → providerUsage["opencode-go"].goApi
   //   DeepSeek 余额 → providerUsage.deepseek.deepseek
+  //   StepFun 余额 + Step Plan Credit → providerUsage.stepfun.stepfun
   //   ChatGPT 限额 → providerUsage.openai.chatgpt
   // V2 的凭证存放在 opencode.db，TUI 进程读不到，所以这里不再自己带 key 请求接口
   // （旧版从 auth.json 取 key，在 V2 下该文件不存在，永远拉不到数据）。
@@ -758,6 +832,7 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
     const puMap = providers()
     const keys = readConfiguredProviders()
     const meta = PROVIDER_META.find((m) => m.id === id)
+    const pu = providerUsageFor(puMap, id)
     return [
       {
         id,
@@ -765,8 +840,8 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
         color: meta?.color ?? "#94a3b8",
         glyph: meta?.glyph ?? "●",
         active: true,
-        configured: Boolean(keys[id]) || Boolean(puMap[id]?.tokenrhythm),
-        pu: puMap[id],
+        configured: Boolean(keys[id]) || Boolean(isStepFunProvider(id) && (keys.stepfun || keys.step || keys["stepfun-step-plan"])) || Boolean(pu?.tokenrhythm),
+        pu,
       },
     ]
   })
@@ -991,6 +1066,8 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   const ProviderDetails = (id: string, pu?: ProviderUsage) => {
     // DeepSeek 余额由服务端插件轮询后写入数据文件
     const ds = id === "deepseek" ? pu?.deepseek : undefined
+    // StepFun 余额由服务端插件轮询后写入数据文件
+    const sf = isStepFunProvider(id) ? pu?.stepfun : undefined
     return (
     <box paddingLeft={2}>
       <Show when={id === "opencode-go" && goUsage()}>
@@ -1060,6 +1137,67 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
         </Show>
         <Show when={ds!.isAvailable === false}>
           <text fg={theme().warning} paddingLeft={2}>{t.deepseekUnavailable}</text>
+        </Show>
+      </Show>
+
+      <Show when={isStepFunProvider(id) && sf}>
+        <Show when={sf!.stepPlan?.planName || sf!.accountType}>
+          {InfoRow(t.plan, sf!.stepPlan?.planName || sf!.accountType!)}
+        </Show>
+        <Show when={sf!.stepPlan?.fiveHourLeftRate != null}>
+          {(() => {
+            const used = leftRateToUsedPct(sf!.stepPlan!.fiveHourLeftRate!)
+            return (
+              <box>
+                {BarRow(t.rolling5h, used, pctColor(used))}
+                <Show when={sf!.stepPlan!.fiveHourResetTime}>
+                  {InfoRow(t.resets, resetIn(sf!.stepPlan!.fiveHourResetTime!))}
+                </Show>
+              </box>
+            )
+          })()}
+        </Show>
+        <Show when={sf!.stepPlan?.weeklyLeftRate != null}>
+          {(() => {
+            const used = leftRateToUsedPct(sf!.stepPlan!.weeklyLeftRate!)
+            return (
+              <box>
+                {BarRow(t.weekly, used, pctColor(used))}
+                <Show when={sf!.stepPlan!.weeklyResetTime}>
+                  {InfoRow(t.resets, resetIn(sf!.stepPlan!.weeklyResetTime!))}
+                </Show>
+              </box>
+            )
+          })()}
+        </Show>
+        <Show when={sf!.stepPlan?.creditLeftRate != null}>
+          {(() => {
+            const used = leftRateToUsedPct(sf!.stepPlan!.creditLeftRate!)
+            return (
+              <box>
+                {BarRow(t.stepfunCreditUsage, used, pctColor(used))}
+                <Show when={sf!.stepPlan!.creditResetTime}>
+                  {InfoRow(t.resets, resetIn(sf!.stepPlan!.creditResetTime!))}
+                </Show>
+              </box>
+            )
+          })()}
+        </Show>
+        <Show when={sf!.stepPlan?.creditUsed != null}>
+          {InfoRow(t.stepfunCreditUsed, fmtStepCredits(sf!.stepPlan!.creditUsed!))}
+        </Show>
+        <Show when={sf!.stepPlan?.calls != null}>
+          {InfoRow(t.stepfunCalls, sf!.stepPlan!.calls!.toLocaleString())}
+        </Show>
+        <Show when={sf!.balance != null}>
+          {InfoRow(t.stepfunBalance, fmtMoney(sf!.balance!, sf!.currency))}
+        </Show>
+        {/* Cookie 问题提示：有旧数据时也显示（数据可能是旧的），与 TokenRhythm 一致 */}
+        <Show when={sf!.stepPlan?.notConfigured}>
+          <text fg={theme().warning} paddingLeft={2}>{t.stepfunCookieNotSet}</text>
+        </Show>
+        <Show when={sf!.stepPlan?.authExpired}>
+          <text fg={theme().warning} paddingLeft={2}>{t.stepfunCookieExpired}</text>
         </Show>
       </Show>
 
@@ -1212,6 +1350,21 @@ async function checkAllAlerts(api: any, data: UsageData, t: Strings, threshold: 
         }
       }
     }
+    if (isStepFunProvider(pid) && pu.stepfun?.stepPlan) {
+      const sp = pu.stepfun.stepPlan
+      const stepFunWindows: Array<[string, number | undefined]> = [
+        [t.rolling5h, sp.fiveHourLeftRate],
+        [t.weekly, sp.weeklyLeftRate],
+        [t.stepfunCreditUsage, sp.creditLeftRate],
+      ]
+      for (const [wname, leftRate] of stepFunWindows) {
+        if (leftRate == null) continue
+        const pct = leftRateToUsedPct(leftRate)
+        if (crossedThreshold(`stepfun.${wname}`, pct, threshold)) {
+          alerts.push({ name: `${name} ${wname}`, pct })
+        }
+      }
+    }
     if (pu.cost != null && pu.limit != null && pu.limit > 0) {
       const pct = (pu.cost / pu.limit) * 100
       if (crossedThreshold(`cost.${pid}`, pct, threshold)) {
@@ -1271,7 +1424,8 @@ function UsageStatusBar(props: { api: any; sessionId?: string; lang: Lang }) {
   const windows = createMemo(() => {
     const id = activeId()
     if (!id) return []
-    const pu = data().providerUsage?.[id]
+    const providerUsage = data().providerUsage ?? {}
+    const pu = providerUsageFor(providerUsage, id)
     const out: Array<{ name: string; pct: number }> = []
     if (id === "opencode-go" && pu?.goApi) {
       out.push({ name: t.rolling5h, pct: pu.goApi.rolling.percent })
@@ -1282,6 +1436,11 @@ function UsageStatusBar(props: { api: any; sessionId?: string; lang: Lang }) {
       if (pu.chatgpt.secondary) {
         out.push({ name: windowLabel(pu.chatgpt.secondary, t), pct: pu.chatgpt.secondary.percent })
       }
+    } else if (isStepFunProvider(id) && pu?.stepfun?.stepPlan) {
+      const sp = pu.stepfun.stepPlan
+      if (sp.fiveHourLeftRate != null) out.push({ name: t.rolling5h, pct: leftRateToUsedPct(sp.fiveHourLeftRate) })
+      if (sp.weeklyLeftRate != null) out.push({ name: t.weekly, pct: leftRateToUsedPct(sp.weeklyLeftRate) })
+      if (sp.creditLeftRate != null) out.push({ name: t.stepfunCreditUsage, pct: leftRateToUsedPct(sp.creditLeftRate) })
     } else if (pu?.cost != null && pu?.limit != null && pu.limit > 0) {
       out.push({ name: t.used, pct: (pu.cost / pu.limit) * 100 })
     }
