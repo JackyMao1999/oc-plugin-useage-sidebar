@@ -325,13 +325,34 @@ if ((UNINSTALL)); then
   merge_config uninstall "$SERVER_CONFIG" plugins "$SCRIPT_DIR"
   merge_config uninstall "$SERVER_CONFIG" plugin "$SERVER_ENTRY"
   merge_config uninstall "$LEGACY_TUI_CONFIG" plugin "$TUI_ENTRY"
+  merge_config uninstall "$LEGACY_TUI_CONFIG" plugin "$LOCAL_TUI_ENTRY"
   merge_config uninstall "$CLI_CONFIG" plugins "$SCRIPT_DIR"
+  merge_config uninstall "$CLI_CONFIG" plugins "$TUI_ENTRY"
+  merge_config uninstall "$CLI_CONFIG" plugins "$LOCAL_TUI_ENTRY"
   info "plugin removed from OpenCode configuration"
   info "usage data was kept at $HOME/.opencode/oc-plugin-usage-data.json"
   exit 0
 fi
 
-if ((SKIP_DEPS == 0)) && [[ ! -d "$SCRIPT_DIR/node_modules" ]]; then
+# Dependency check must not rely on the node_modules directory alone: a
+# node_modules left over from the V1 layout has no V2 @opencode/plugin, so the
+# installer would skip npm install and OpenCode would fail with
+#   failed to load plugin ... Cannot find package '@opencode/plugin'
+REQUIRED_MODULES=(
+  "@opencode/plugin"
+  "@opentui/core"
+  "@opentui/solid"
+  "solid-js"
+)
+
+missing_modules() {
+  local module
+  for module in "${REQUIRED_MODULES[@]}"; do
+    [[ -f "$SCRIPT_DIR/node_modules/$module/package.json" ]] || printf '%s ' "$module"
+  done
+}
+
+install_dependencies() {
   if command -v npm >/dev/null 2>&1; then
     info "installing JavaScript dependencies"
     (cd "$SCRIPT_DIR" && npm install --no-audit --no-fund)
@@ -341,14 +362,34 @@ if ((SKIP_DEPS == 0)) && [[ ! -d "$SCRIPT_DIR/node_modules" ]]; then
   else
     die "npm or bun is required (or rerun with --skip-deps if OpenCode provides the dependencies)"
   fi
+}
+
+if ((SKIP_DEPS == 0)); then
+  missing="$(missing_modules)"
+  if [[ -n "$missing" ]]; then
+    if [[ -d "$SCRIPT_DIR/node_modules" ]]; then
+      info "node_modules is incomplete, missing: ${missing% }"
+    fi
+    install_dependencies
+    missing="$(missing_modules)"
+    if [[ -n "$missing" ]]; then
+      die "dependencies are still missing after install: ${missing% } (try: cd $SCRIPT_DIR && npm install)"
+    fi
+  fi
 fi
 
 # OpenCode V2 loads the ./tui export of a configured server plugin
-# automatically. No separate tui.json or cli.json registration is needed.
+# automatically, so the legacy per-file registrations (opencode.json "plugin",
+# tui.json, cli.json) must be removed — leaving them behind loads the sidebar
+# twice, once as a server plugin and once as a CLI plugin.
 merge_config uninstall "$SERVER_CONFIG" plugin "$SERVER_ENTRY"
 merge_config uninstall "$LEGACY_TUI_CONFIG" plugin "$TUI_ENTRY"
+merge_config uninstall "$LEGACY_TUI_CONFIG" plugin "$LOCAL_TUI_ENTRY"
+merge_config uninstall "$CLI_CONFIG" plugins "$SCRIPT_DIR"
+merge_config uninstall "$CLI_CONFIG" plugins "$TUI_ENTRY"
+merge_config uninstall "$CLI_CONFIG" plugins "$LOCAL_TUI_ENTRY"
 merge_config install "$SERVER_CONFIG" plugins "$SCRIPT_DIR" "{\"language\":\"$LANGUAGE\"}"
 
 info "OpenCode V2 installation complete"
 info "config: $SERVER_CONFIG"
-info "restart OpenCode to load the plugin"
+info "restart the shared service to load the plugin: opencode service restart"

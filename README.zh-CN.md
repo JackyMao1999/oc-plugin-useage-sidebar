@@ -89,9 +89,15 @@ npx tsc   # 可选，类型检查/构建
 改完重启 opencode 生效；`usageThresholdPercent` 同样支持这两种写法。不需要单独配置 `tui.json`
 或 `cli.json`，OpenCode V2 会自动加载插件包的 `./tui` 导出。
 
-### 3. 重启 opencode
+### 3. 重启 opencode 服务
 
-插件只在启动时加载。退出后重新运行 `opencode` —— 右侧侧边栏会出现 **Usage → Session Cache → Providers**。
+插件在共享后台服务启动时加载，所以只退出 TUI 是不够的（后台服务会继续运行并沿用旧的插件状态）。先退出所有 opencode 客户端，然后执行：
+
+```bash
+opencode service restart
+```
+
+再重新运行 `opencode`，右侧侧边栏就会出现 **Usage → Session Cache → Providers**。
 
 ### 工作空间 / Go 套餐
 

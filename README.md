@@ -92,10 +92,18 @@ Global config (`~/.config/opencode/opencode.json`, or `~/.opencode/opencode.json
 changing it. `usageThresholdPercent` can be set the same two ways. No separate `tui.json` or
 `cli.json` entry is needed: OpenCode V2 loads the package's `./tui` export.
 
-### 3. Restart opencode
+### 3. Restart the OpenCode service
 
-Plugins load only at startup. Quit and run `opencode` again — the right sidebar
-will show **Usage → Session Cache → Providers**.
+Plugins load when the shared background service starts, so quitting the TUI is
+not enough — the service keeps running and holds the previous plugin state.
+Quit every opencode client, then run:
+
+```bash
+opencode service restart
+```
+
+Reopen `opencode` and the right sidebar will show
+**Usage → Session Cache → Providers**.
 
 ### Workspace / Go plan
 
