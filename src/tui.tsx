@@ -865,12 +865,13 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
     <text fg={theme().borderSubtle}>{"─".repeat(24)}</text>
   )
 
-  // fmtTokens: 把 token 数格式化成易读形式
-  //   例：fmtTokens(123456) → "123.5k"
+  // fmtTokens: 把 token 数格式化成带单位的易读形式
+  //   例：fmtTokens(123456) → "123.5K"，fmtTokens(1230000) → "1.2M"
   const fmtTokens = (n: number) => {
+    if (n >= 1e12) return (n / 1e12).toFixed(1) + "T"
     if (n >= 1e9) return (n / 1e9).toFixed(1) + "B"
     if (n >= 1e6) return (n / 1e6).toFixed(1) + "M"
-    if (n >= 1e3) return (n / 1e3).toFixed(1) + "k"
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + "K"
     return String(n)
   }
 
@@ -992,7 +993,7 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
       </Show>
 
       <Show when={pu?.totalTokens != null}>
-        {InfoRow(t.tokens, pu!.totalTokens!.toLocaleString())}
+        {InfoRow(t.tokens, fmtTokens(pu!.totalTokens!))}
       </Show>
 
     </box>

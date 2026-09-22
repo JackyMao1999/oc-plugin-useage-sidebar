@@ -632,6 +632,16 @@ function formatDurationMs(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
 }
 
+// 把 token 数格式化成带单位的易读形式：1.2K / 3.4M / 5.6B / 7.8T
+function formatTokens(n: number): string {
+  if (!Number.isFinite(n)) return String(n);
+  if (n >= 1e12) return `${(n / 1e12).toFixed(1)}T`;
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+  return String(n);
+}
+
 function formatProviderUsage(pu: ProviderUsage, label: string): string {
   const lines: string[] = [`--- ${label} ---`];
   const fmtPct = (n: number) => (Number.isInteger(n) ? String(n) : n.toFixed(1));
@@ -679,7 +689,7 @@ function formatProviderUsage(pu: ProviderUsage, label: string): string {
     lines.push(`  Monthly:    ${fmt(pu.goWindows.monthly)}`);
   } else {
     if (pu.cost != null) lines.push(`  Cost:       $${pu.cost.toFixed(2)}`);
-    if (pu.totalTokens != null) lines.push(`  Tokens:     ${pu.totalTokens.toLocaleString()}`);
+    if (pu.totalTokens != null) lines.push(`  Tokens:     ${formatTokens(pu.totalTokens)}`);
     if (pu.limit != null) lines.push(`  Limit:      $${pu.limit}`);
     if (pu.remaining != null) lines.push(`  Remaining:  $${pu.remaining.toFixed(2)}`);
     if (pu.limit != null && pu.cost != null && pu.limit > 0) {
