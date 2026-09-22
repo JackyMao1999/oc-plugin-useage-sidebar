@@ -460,6 +460,10 @@ const DISPLAY_NAMES: Record<string, string> = {
   "stepfun-step-plan": "StepFun",
 }
 
+// 会话面板里"空闲"会话的保留窗口：只列出最近 30 分钟内活跃过的空闲会话，
+// 否则时间一长面板会变成陈年会话清单（运行中/待确认的会话不受此限制）
+const SESSION_IDLE_WINDOW_MS = 30 * 60 * 1000
+
 const STEPFUN_PROVIDER_IDS = new Set(["stepfun", "step", "stepfun-step-plan"])
 function isStepFunProvider(providerID: string): boolean {
   return STEPFUN_PROVIDER_IDS.has(providerID)
@@ -557,6 +561,17 @@ interface Strings {
   stepfunCalls: string
   stepfunCookieExpired: string
   stepfunCookieNotSet: string
+  sessions: string
+  noSessions: string
+  statusBusy: string
+  statusIdle: string
+  statusRetry: string
+  statusNeedsInput: string
+  sessionUntitled: string
+  sessionsMore: (n: number) => string
+  toastDone: string
+  toastPermission: string
+  toastForm: string
   threshold: string
   adjustThreshold: string
   setThresholdTitle: string
@@ -621,6 +636,17 @@ function makeStrings(lang: Lang): Strings {
         stepfunCalls: "今日调用",
         stepfunCookieExpired: "Cookie 已过期，请更新 stepfun-cookie.txt",
         stepfunCookieNotSet: "未配置 Cookie，无法读取套餐用量（见 README）",
+        sessions: "会话",
+        noSessions: "没有运行中的会话",
+        statusBusy: "运行中",
+        statusIdle: "空闲",
+        statusRetry: "重试中",
+        statusNeedsInput: "待确认",
+        sessionUntitled: "未命名会话",
+        sessionsMore: (n: number) => `还有 ${n} 个会话`,
+        toastDone: "任务完成",
+        toastPermission: "需要授权确认",
+        toastForm: "需要你的选择",
         threshold: "提醒阈值",
         adjustThreshold: "调整阈值",
         setThresholdTitle: "设置用量提醒阈值 (%)",
@@ -683,6 +709,17 @@ function makeStrings(lang: Lang): Strings {
         stepfunCalls: "Calls today",
         stepfunCookieExpired: "Cookie expired, update stepfun-cookie.txt",
         stepfunCookieNotSet: "Cookie not set, plan usage unavailable (see README)",
+        sessions: "Sessions",
+        noSessions: "No sessions running",
+        statusBusy: "Working",
+        statusIdle: "Idle",
+        statusRetry: "Retrying",
+        statusNeedsInput: "Needs input",
+        sessionUntitled: "Untitled session",
+        sessionsMore: (n: number) => `${n} more session${n > 1 ? "s" : ""}`,
+        toastDone: "Task finished",
+        toastPermission: "Permission needed",
+        toastForm: "Input needed",
         threshold: "Alert threshold",
         adjustThreshold: "Adjust threshold",
         setThresholdTitle: "Set usage alert threshold (%)",
@@ -775,7 +812,7 @@ function legacyTheme(theme: any) {
  *     ▼ Session Cache ← 当前会话的缓存命中率
  *     ▼ Providers     ← OpenAI/Anthropic/Go/Zen 的费用和进度条
  */
-function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
+function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSessions?: boolean }) {
   // t : 当前语言的界面文案（en 或 zh，由插件 options.language 控制）
   const t = makeStrings(props.lang ?? "en")
 
@@ -794,6 +831,7 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   const [open, setOpen] = createSignal(true)              // Usage 总标题
   const [openCache, setOpenCache] = createSignal(true)    // Session Cache 区域（默认展开）
   const [openProviders, setOpenProviders] = createSignal(true) // Providers 区域（默认展开）
+  const [openSessions, setOpenSessions] = createSignal(true)   // Sessions 区域（默认展开，可点击折叠）
 
   // 所有 provider 用量都由服务端插件（index.ts）采集后写进 JSON 文件：
   //   Go / Zen 套餐 → providerUsage["opencode-go"].goApi
@@ -886,6 +924,59 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
       },
     ]
   })
+
+  // sessionRows : 所有会话的状态列表（会话面板的数据源）
+  //   符号含义：? 待确认（授权/表单）、↻ 重试中、● 运行中、○ 空闲
+  //   排序：待确认 > 运行中/重试 > 空闲，同组内按最近更新时间
+  const sessionRows = createMemo(() => {
+    if (props.showSessions === false) return []
+    props.api.state.revision?.()
+    const list = (props.api.state.sessions?.() ?? []) as any[]
+    const currentID = props.sessionId
+    const rows: Array<{
+      id: string
+      title: string
+      glyph: string
+      color: string
+      statusText: string
+      current: boolean
+      rank: number
+      updated: number
+    }> = []
+    for (const info of list) {
+      if (!info?.id || info.time?.archived) continue
+      const needsInput = (props.api.state.sessionNeedsInput?.(info.id) ?? 0) > 0
+      const status = props.api.state.sessionStatus?.(info.id)
+      const busy = status === "running"
+      const retry = status === "retry"
+      const child = Boolean(info.parentID)
+      // 子会话只在真正干活/等人时才列出，避免刷屏
+      if (child && !needsInput && !busy && !retry) continue
+      const updated = Number(info.time?.updated) || 0
+      const idle = !needsInput && !busy && !retry
+      // 空闲会话只保留最近活跃的（以及当前正在看的那个）
+      if (idle && info.id !== currentID && Date.now() - updated > SESSION_IDLE_WINDOW_MS) continue
+      const title = String(info.title ?? "").trim() || t.sessionUntitled
+      const label = child ? `└ ${title}` : title
+      if (needsInput) {
+        // 需要用户操作：最高优先级，用问号标出
+        rows.push({ id: info.id, title: label, glyph: "?", color: theme().warning, statusText: t.statusNeedsInput, current: info.id === currentID, rank: 3, updated: Number(info.time?.updated) || 0 })
+      } else if (retry) {
+        rows.push({ id: info.id, title: label, glyph: "↻", color: theme().warning, statusText: t.statusRetry, current: info.id === currentID, rank: 2, updated: Number(info.time?.updated) || 0 })
+      } else if (busy) {
+        rows.push({ id: info.id, title: label, glyph: "●", color: theme().accent, statusText: t.statusBusy, current: info.id === currentID, rank: 2, updated: Number(info.time?.updated) || 0 })
+      } else {
+        rows.push({ id: info.id, title: label, glyph: "○", color: theme().textMuted, statusText: "", current: info.id === currentID, rank: 1, updated: Number(info.time?.updated) || 0 })
+      }
+    }
+    rows.sort((a, b) => b.rank - a.rank || b.updated - a.updated)
+    return rows
+  })
+
+  // 面板最多列 10 行，多出来的用一行 "还有 N 个会话" 概括
+  const SESSION_ROW_LIMIT = 10
+  const visibleSessionRows = createMemo(() => sessionRows().slice(0, SESSION_ROW_LIMIT))
+  const hiddenSessionCount = createMemo(() => Math.max(0, sessionRows().length - SESSION_ROW_LIMIT))
 
   // goUsage : 服务端插件写入的官方 /zen/go/v1/usage 快照，没有才回退到本地累计的 goWindows
   const goUsage = createMemo(() => providers()["opencode-go"]?.goApi ?? null)
@@ -1027,6 +1118,20 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
   const padLabel = (s: string, width = 10) => {
     const pad = Math.max(0, width - displayWidth(s))
     return s + " ".repeat(pad)
+  }
+
+  // truncate: 按终端显示宽度截断（中文等宽字符按 2 格算），超出用 … 结尾
+  const truncate = (s: string, max: number) => {
+    if (displayWidth(s) <= max) return s
+    let out = ""
+    let width = 0
+    for (const ch of s) {
+      const w = ch.charCodeAt(0) > 255 ? 2 : 1
+      if (width + w > max - 1) break
+      out += ch
+      width += w
+    }
+    return out + "…"
   }
 
   // BarRow: 一行"标签 + 色块进度条 + 百分比"
@@ -1308,6 +1413,47 @@ return (
           </Show>
 
           {divider()}
+
+          <box flexDirection="row" gap={1} onMouseDown={() => setOpenSessions((x) => !x)}>
+            {label(openSessions())}
+            <text fg={theme().text}><b>🗂 {t.sessions}</b></text>
+            <text fg={theme().textMuted}>({sessionRows().length})</text>
+          </box>
+          <Show when={openSessions()}>
+            <box paddingLeft={2}>
+              <Show when={sessionRows().length === 0}>
+                <text fg={theme().textMuted}>{t.noSessions}</text>
+              </Show>
+              <Show when={sessionRows().length > 0}>
+                {/* 用方框把会话列表圈起来，符号表示状态（见 sessionRows 注释） */}
+                <box
+                  border
+                  borderStyle="rounded"
+                  borderColor={theme().borderSubtle}
+                  flexDirection="column"
+                  paddingLeft={1}
+                  paddingRight={1}
+                >
+                  <For each={visibleSessionRows()}>
+                    {(row) => (
+                      <box flexDirection="row" gap={1}>
+                        <text fg={row.color}>{row.glyph}</text>
+                        <text fg={row.current ? theme().accent : theme().text}>
+                          {row.current ? "› " : "  "}{truncate(row.title, 18)}
+                        </text>
+                        <Show when={row.statusText}>
+                          <text fg={row.color}>{row.statusText}</text>
+                        </Show>
+                      </box>
+                    )}
+                  </For>
+                  <Show when={hiddenSessionCount() > 0}>
+                    <text fg={theme().textMuted}>{t.sessionsMore(hiddenSessionCount())}</text>
+                  </Show>
+                </box>
+              </Show>
+            </box>
+          </Show>
 
           <box flexDirection="row" gap={1} onMouseDown={() => setOpenProviders((x) => !x)}>
             {label(openProviders())}
@@ -1637,7 +1783,12 @@ function createTuiApi(context: any) {
     const event = details
     const payload = event?.data
     if (!payload?.assistantMessageID) {
-      if (event?.type === "session.created" || event?.type === "session.model.selected") setRevision((value) => value + 1)
+      // 会话面板要跟着 session.* / permission.* / form.* 变化重绘，这些事件没有
+      // assistantMessageID，所以单独判断（顺带覆盖 session.created / model.selected）
+      const type = String(event?.type ?? "")
+      if (type.startsWith("session.") || type.startsWith("permission.") || type.startsWith("form.")) {
+        setRevision((value) => value + 1)
+      }
       return
     }
     const key = `${payload.assistantMessageID}:${payload.ordinal ?? 0}`
@@ -1705,6 +1856,31 @@ function createTuiApi(context: any) {
       part: parts,
       providers: () => context.data.location.provider.list(location) ?? [],
       integrations: () => context.data.location.integration.list(location) ?? [],
+      // 所有会话（含子会话）及其状态：会话面板用来展示每个会话在干什么
+      sessions: () => {
+        try {
+          return context.data.session.list() ?? []
+        } catch {
+          return []
+        }
+      },
+      sessionStatus: (sessionID: string): "idle" | "running" => {
+        try {
+          return context.data.session.status(sessionID)
+        } catch {
+          return "idle"
+        }
+      },
+      // 需要用户操作的次数：授权确认（permission）+ 表单选择（form）
+      sessionNeedsInput: (sessionID: string): number => {
+        try {
+          const permissions = context.data.session.permission.list(sessionID)?.length ?? 0
+          const forms = context.data.session.form.list(sessionID)?.length ?? 0
+          return permissions + forms
+        } catch {
+          return 0
+        }
+      },
     },
     client: context.client,
     attention: context.attention,
@@ -1732,7 +1908,56 @@ const TuiPlugin = Plugin.define({
       writeThresholdFile(configuredThreshold)
     }
     const t = makeStrings(lang)
+    // 会话面板 / 跨会话 Toast 可以用插件选项关掉（默认都开）
+    const sessionsPanel = options.sessionsPanel !== false
+    const sessionToasts = options.sessionToasts !== false
     const { api, dispose: disposeApi } = createTuiApi(context)
+
+    // -------- 别的会话完成任务 / 需要选择时弹 Toast --------
+    // 多个 opencode 窗口共用同一个后台服务，所有会话的事件都会流到每个 TUI 进程，
+    // 所以这里能看到"另一个窗口里的会话"的动态。只对当前正在看的会话不提醒。
+    const recentSessionToasts = new Set<string>()
+    const viewedSessionID = (): string | undefined => {
+      try {
+        const route = context.ui.router.current() as any
+        return route?.type === "session" ? route.sessionID : undefined
+      } catch {
+        return undefined
+      }
+    }
+    const toastForOtherSession = (kind: "done" | "permission" | "form", sessionID?: string, eventKey?: string) => {
+      if (!sessionToasts || !sessionID) return
+      try {
+        const info = context.data.session.get(sessionID) as any
+        // 子会话的完成/授权由父会话兜底，避免一次任务弹好几条
+        if (info?.parentID) return
+        if (sessionID === viewedSessionID()) return
+        const key = `${kind}:${sessionID}:${eventKey ?? ""}`
+        if (recentSessionToasts.has(key)) return
+        recentSessionToasts.add(key)
+        if (recentSessionToasts.size > 200) recentSessionToasts.clear()
+        const title = String(info?.title ?? "").trim() || t.sessionUntitled
+        const message = kind === "done" ? t.toastDone : kind === "permission" ? t.toastPermission : t.toastForm
+        context.ui.toast.show({
+          variant: kind === "done" ? "success" : "warning",
+          title,
+          message,
+          duration: 8000,
+        })
+      } catch {
+        // 会话信息还没同步过来时忽略
+      }
+    }
+    const stopSessionDone = context.data.on("session.execution.succeeded", (event: any) => {
+      toastForOtherSession("done", event?.data?.sessionID, event?.id)
+    })
+    const stopSessionPermission = context.data.on("permission.asked", (event: any) => {
+      toastForOtherSession("permission", event?.data?.sessionID, event?.data?.id)
+    })
+    const stopSessionForm = context.data.on("form.created", (event: any) => {
+      const form = event?.data?.form
+      toastForOtherSession("form", form?.sessionID, form?.id ?? event?.id)
+    })
 
     const openThresholdDialog = async () => {
       const current = readThresholdFile()
@@ -1813,7 +2038,7 @@ const TuiPlugin = Plugin.define({
       append: "sidebar.content",
       render: (input: { sessionID: string }) => {
         activeSessionID = input.sessionID
-        return <UsageSidebar api={api} sessionId={input.sessionID} lang={lang} />
+        return <UsageSidebar api={api} sessionId={input.sessionID} lang={lang} showSessions={sessionsPanel} />
       },
     })
     const unregisterFooter = context.ui.slot({
@@ -1825,6 +2050,9 @@ const TuiPlugin = Plugin.define({
     })
 
     return () => {
+      stopSessionDone()
+      stopSessionPermission()
+      stopSessionForm()
       unregisterApp()
       unregisterContent()
       unregisterFooter()

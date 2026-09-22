@@ -10,6 +10,8 @@ AI model usage monitoring plugin for [opencode](https://opencode.ai). Tracks ses
 - **Session cache hit rate** — live `cache read / (input + read)` for the current session (Hit rate, Input, Read, Write)
 - **Response speed** — tracks time to first token (TTFT) and output throughput (Tokens/s); the sidebar shows current-session averages, while `usage_stats` shows persisted totals
 - **Resettable token counter** — the sidebar's token count is accumulated by the plugin; press `Ctrl+Y` (or run "Reset token usage" from the command palette) to zero the current provider's count, after which it accumulates again from zero
+- **Session status panel** — a framed list of every session with a status symbol: `?` needs input (permission/form), `↻` retrying, `●` working, `○` idle (the current session is marked with `›`; idle subagent sessions are hidden and idle sessions older than 30 minutes drop off). Click the header to collapse, or turn the whole panel off with `sessionsPanel: false`
+- **Cross-session toasts** — when a session in another OpenCode window finishes a task, asks for permission, or needs a choice, the current window shows a toast (the toast title is the session name). The session you are already watching is not re-announced; disable with `sessionToasts: false`
 - **Go plan usage** — official API percent windows (rolling 5h / weekly / monthly) with reset countdown
 - **ChatGPT usage** — reads `wham/usage` and `wham/usage/credit-usage-events` from the ChatGPT backend for plan type, rate-limit windows (5h / weekly / monthly, picked from `limit_window_seconds` so whichever windows the account has are labelled correctly), remaining Credits, and the same 7-day Codex/Work Credits totals shown by Codex Cloud Analytics. Works with the standard OpenAI OAuth login — no API key needed; the plugin reads the credential from OpenCode V2's credential store and never refreshes the one-time OpenAI refresh token itself
 - **TokenRhythm account** — when the active provider is `tokenrhythm`, shows the actual available balance (实际可用总额) and cumulative cost (累计成本) from tokenrhythm.studio — the same numbers as the account page. Requires a browser session cookie (see below)
@@ -233,6 +235,8 @@ them in `~/.config/opencode/cli.json`:
 | `chatGptAccountId` | `string` | — | Optional ChatGPT workspace account ID; omit for a personal account |
 | `tokenrhythmCookie` | `string` | — | TokenRhythm session cookie (alternative to `~/.opencode/tokenrhythm-cookie.txt`) |
 | `usageThresholdPercent` | `number` | `80` | Percentage at which toast warning fires |
+| `sessionsPanel` | `boolean` | `true` | Show the "Sessions" status panel in the sidebar (the header also collapses on click) |
+| `sessionToasts` | `boolean` | `true` | Toast when another session finishes, asks for permission, or needs input |
 | `language` (tui plugin) | `string` | `en` | Sidebar language: `en` or `zh` |
 
 ## Data collected
