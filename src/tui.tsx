@@ -1779,6 +1779,69 @@ function createTuiApi(context: any) {
   modelPicks.refresh()
   const modelPickTimer = setInterval(() => modelPicks.refresh(), 2000)
 
+  // -------- 跨窗口 / 跨目录的会话快照 --------
+  // 本地 data.session 只覆盖当前 TUI 所在目录，而且一个 TUI 进程只从自己启动那一刻
+  // 开始收事件：后打开的窗口看不到之前启动的会话，别的目录的会话也看不到。
+  // 所有窗口共用同一个后台服务，所以列表、运行状态、待确认数量都直接问服务端。
+  const [serverSessions, setServerSessions] = createSignal<any[]>([])
+  const [activeSessionIDs, setActiveSessionIDs] = createSignal<ReadonlySet<string>>(new Set())
+  // 已经发生的"待确认"事件（授权 / 表单），按会话累计；服务端查询是单目录的，
+  // 事件是全局的，两者取较大值（见 sessionNeedsInput）
+  const pendingEvents = new Map<string, Set<string>>()
+  let pendingEventTotal = 0
+  const [serverPending, setServerPending] = createSignal<Record<string, number>>({})
+  let refreshingSessions = false
+  let lastSessionsRefresh = 0
+
+  const refreshSessions = async () => {
+    if (refreshingSessions) return
+    refreshingSessions = true
+    lastSessionsRefresh = Date.now()
+    try {
+      const [sessions, active, permissions, forms] = await Promise.all([
+        context.client.session.list({ limit: 50 }) as Promise<any>,
+        context.client.session.active() as Promise<any>,
+        context.client.permission.request.list() as Promise<any>,
+        context.client.form.list() as Promise<any>,
+      ])
+      if (Array.isArray(sessions?.data)) setServerSessions(sessions.data)
+      // session.active() 直接返回 id→状态 的映射（不套 data 字段），这里两种形状都兼容
+      const activeMap = active?.data ?? active
+      if (activeMap && typeof activeMap === "object") setActiveSessionIDs(new Set(Object.keys(activeMap)))
+      const counts: Record<string, number> = {}
+      for (const item of [...(permissions?.data ?? []), ...(forms?.data ?? [])]) {
+        const sessionID = item?.sessionID
+        if (sessionID) counts[sessionID] = (counts[sessionID] ?? 0) + 1
+      }
+      setServerPending(counts)
+      setRevision((value) => value + 1)
+    } catch {
+      // 服务端暂时不可用时保留上一次的快照
+    } finally {
+      refreshingSessions = false
+    }
+  }
+  void refreshSessions()
+  const sessionsTimer = setInterval(() => { void refreshSessions() }, 5000)
+  // 事件到来时立刻刷新一次（1 秒节流，避免高频事件打爆请求）
+  const scheduleSessionsRefresh = () => {
+    if (Date.now() - lastSessionsRefresh < 1000) return
+    void refreshSessions()
+  }
+  const trackPendingInput = (sessionID: unknown, id: unknown, add: boolean) => {
+    if (typeof sessionID !== "string" || !sessionID) return
+    const key = typeof id === "string" && id ? id : `${sessionID}:${pendingEventTotal++}`
+    let set = pendingEvents.get(sessionID)
+    if (!set) {
+      set = new Set<string>()
+      pendingEvents.set(sessionID, set)
+    }
+    if (add) set.add(key)
+    else set.delete(key)
+    if (set.size === 0) pendingEvents.delete(sessionID)
+    setRevision((value) => value + 1)
+  }
+
   const stopListening = context.data.listen(({ details }: { details: any }) => {
     const event = details
     const payload = event?.data
@@ -1787,7 +1850,13 @@ function createTuiApi(context: any) {
       // assistantMessageID，所以单独判断（顺带覆盖 session.created / model.selected）
       const type = String(event?.type ?? "")
       if (type.startsWith("session.") || type.startsWith("permission.") || type.startsWith("form.")) {
+        // "需要用户操作"是全局事件，即使会话在别的窗口/目录也能统计到
+        if (type === "permission.asked") trackPendingInput(payload?.sessionID, payload?.id, true)
+        else if (type === "permission.replied") trackPendingInput(payload?.sessionID, payload?.requestID, false)
+        else if (type === "form.created") trackPendingInput(payload?.form?.sessionID, payload?.form?.id, true)
+        else if (type === "form.replied" || type === "form.cancelled") trackPendingInput(payload?.sessionID, payload?.id, false)
         setRevision((value) => value + 1)
+        scheduleSessionsRefresh()
       }
       return
     }
@@ -1856,30 +1925,48 @@ function createTuiApi(context: any) {
       part: parts,
       providers: () => context.data.location.provider.list(location) ?? [],
       integrations: () => context.data.location.integration.list(location) ?? [],
-      // 所有会话（含子会话）及其状态：会话面板用来展示每个会话在干什么
+      // 所有会话（含子会话、别的窗口/目录的会话）及其状态
+      // 服务端快照为主（含之前启动的会话），本地缓存补最新创建、还没进快照的会话
       sessions: () => {
-        try {
-          return context.data.session.list() ?? []
-        } catch {
-          return []
+        const merged = new Map<string, any>()
+        for (const info of serverSessions()) {
+          if (info?.id) merged.set(info.id, info)
         }
+        try {
+          for (const info of context.data.session.list() ?? []) {
+            if (!info?.id) continue
+            const existing = merged.get(info.id)
+            merged.set(info.id, existing ? { ...existing, ...info, time: { ...existing.time, ...info.time } } : info)
+          }
+        } catch {
+          // 本地缓存不可用时只用服务端快照
+        }
+        // 正在运行但不在列表里的会话（列表有 limit）也补上，避免漏掉
+        for (const sessionID of activeSessionIDs()) {
+          if (!merged.has(sessionID)) merged.set(sessionID, { id: sessionID, time: { updated: Date.now() } })
+        }
+        return [...merged.values()]
       },
       sessionStatus: (sessionID: string): "idle" | "running" => {
+        // 本地状态最灵敏（本窗口自己发的指令），其次看服务端的"正在运行"快照
         try {
-          return context.data.session.status(sessionID)
+          if (context.data.session.status(sessionID) === "running") return "running"
         } catch {
-          return "idle"
+          // 本地没有这个会话（别的窗口/目录）时忽略
         }
+        return activeSessionIDs().has(sessionID) ? "running" : "idle"
       },
-      // 需要用户操作的次数：授权确认（permission）+ 表单选择（form）
+      // 需要用户操作的次数：服务端查询（当前目录）+ 全局事件统计，取较大值
       sessionNeedsInput: (sessionID: string): number => {
+        let local = 0
         try {
           const permissions = context.data.session.permission.list(sessionID)?.length ?? 0
           const forms = context.data.session.form.list(sessionID)?.length ?? 0
-          return permissions + forms
+          local = permissions + forms
         } catch {
-          return 0
+          // 本地没有这个会话时忽略
         }
+        return Math.max(local, serverPending()[sessionID] ?? 0, pendingEvents.get(sessionID)?.size ?? 0)
       },
     },
     client: context.client,
@@ -1891,6 +1978,7 @@ function createTuiApi(context: any) {
 
   const dispose = () => {
     clearInterval(modelPickTimer)
+    clearInterval(sessionsTimer)
     stopListening()
   }
 
@@ -1928,7 +2016,8 @@ const TuiPlugin = Plugin.define({
     const toastForOtherSession = (kind: "done" | "permission" | "form", sessionID?: string, eventKey?: string) => {
       if (!sessionToasts || !sessionID) return
       try {
-        const info = context.data.session.get(sessionID) as any
+        // 用会话快照取标题：会话可能属于别的窗口/目录，本地 data.session 里没有
+        const info = (api.state.sessions() as any[]).find((item) => item?.id === sessionID)
         // 子会话的完成/授权由父会话兜底，避免一次任务弹好几条
         if (info?.parentID) return
         if (sessionID === viewedSessionID()) return
