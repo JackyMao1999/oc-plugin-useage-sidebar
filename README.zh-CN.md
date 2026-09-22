@@ -9,6 +9,7 @@
 - **跟随当前模型** — 侧边栏只显示当前使用中的那一个提供商；在 `/models` 里一选新模型就立刻切换（opencode 要等下一次发消息才把选择落库，插件通过 `~/.local/state/opencode/model.json` 提前跟随）
 - **会话缓存命中率** — 实时统计当前会话的 `cache read / (input + read)`，显示 Hit rate、Input、Read、Write
 - **响应速度** — 统计首字延迟（TTFT）和输出速度（Tokens/s）；侧边栏显示当前会话平均值，`usage_stats` 显示持久化累计值
+- **Token 计数可清零** — 侧边栏的 `Token数` 是插件累计值，按 `Ctrl+Y`（或命令面板搜 "Reset token usage"）即可把当前提供商的计数归零，之后的用量重新累计
 - **Go 套餐用量** — 通过官方 API 显示 Rolling 5h / Weekly / Monthly 的已用百分比 + 重置倒计时（超过 24 小时自动显示为天）
 - **ChatGPT 用量** — 读取 ChatGPT 后台的 `wham/usage` 和 `wham/usage/credit-usage-events`，显示计划类型、限额窗口（按 `limit_window_seconds` 自动识别 5 小时 / 每周 / 月度，账号有哪些窗口就显示哪些）、剩余 Credits，以及与 Codex Cloud Analytics 一致的近7天 Codex/Work Credits 汇总；用标准 OpenAI OAuth 登录即可，无需 API key。凭证直接读 OpenCode V2 的凭证存储，插件不会自己去刷 OpenAI 的一次性 refresh token（由 opencode 负责续期）
 - **TokenRhythm 账户** — 当前提供商为 `tokenrhythm` 时，侧边栏显示 tokenrhythm.studio 的**实际可用总额**和**累计成本**（与账户页同源数字）；需要浏览器会话 Cookie（见下文）
@@ -169,6 +170,36 @@ POST https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/GetStepPl
 一条的值也可以）。插件每轮读取该文件，仅把 Cookie 用于本次查询，不会把 Cookie
 或 API key 写入用量 JSON；会话过期后侧边栏会提示"Cookie 已过期"并保留最后一次
 数据，重新复制即可。也可以通过 `stepfunCookie` 插件选项传入 Cookie。
+
+## 快捷键与音效
+
+| 快捷键 | 作用 |
+|--------|------|
+| `Ctrl+O` | 设置用量提醒阈值（也支持命令面板搜 "Set usage alert threshold"） |
+| `Ctrl+Y` | 把当前提供商的 `Token数` 清零（也支持命令面板搜 "Reset token usage"） |
+
+清零只影响侧边栏累计的 Token 计数（`usage_stats` 里的 `Tokens` 也是同一个值），
+不会动费用、余额和套餐用量。实现上由 TUI 写 `tokensResetAt` 标记 + 服务端插件
+落实，多个 opencode 实例同时写数据文件时也不会被"取较大值"的合并逻辑写回旧值。
+
+### 需要确认 / 任务完成时播报音效
+
+这两个音效由 opencode 内置的 attention 机制播放（`permission.asked` → permission 音效；
+会话结束 → done，子会话 → subagent_done），**默认是关闭的**，在 `~/.config/opencode/cli.json` 里打开：
+
+```json
+{
+  "$schema": "https://opencode.ai/v2/cli.json",
+  "attention": {
+    "sound": true,
+    "volume": 0.5
+  }
+}
+```
+
+- `sound: true` 播放音效；再加 `notifications: true` 会同时弹系统通知
+- `sounds` 可以按事件替换音效文件：`{ "permission": "/path/to/x.wav", "done": "/path/to/y.wav" }`
+- 改完需要重启 TUI 生效（`cli.json` 由 TUI 进程读取）
 
 ## 配置项
 

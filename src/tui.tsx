@@ -55,7 +55,8 @@ import { createSignal, createMemo, createEffect, For, Show, onCleanup } from "so
 // readFileSync : 同步读取文件内容（返回字符串或 Buffer）
 // existsSync   : 检查文件是否存在（返回 true/false）
 // writeFileSync : 同步写入文件
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs"
+// renameSync   : 原子替换（先写临时文件再改名，避免读到写了一半的 JSON）
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from "fs"
 
 // join         : 拼接文件路径（跨平台兼容）
 //               例：join("/home/user", ".opencode", "data.json") → "/home/user/.opencode/data.json"
@@ -472,6 +473,34 @@ function providerUsageFor(providerUsage: Record<string, ProviderUsage>, provider
   return { ...direct, stepfun: fallback.stepfun }
 }
 
+/**
+ * 把某个 provider 的累计 Token 数清零（侧边栏上显示的 "Token数"）。
+ *
+ * 只写文件不够：累计值是服务端插件（index.ts）自己算出来的，而它写盘时会做
+ * "数字取较大值"的合并，会把刚清零的数字又恢复成旧值。所以除了 totalTokens = 0，
+ * 还要打一个 tokensResetAt 时间戳，服务端读到更新的标记时会把内存里的累计值
+ * 一起清零（见 index.ts 的 applyTokenResets）。
+ */
+function resetProviderTokens(providerID: string): boolean {
+  try {
+    const file = JSON.parse(readFileSync(DATA_FILE, "utf-8")) as any
+    const usage = file?.providerUsage
+    if (!usage || typeof usage !== "object") return false
+    // StepFun 系列的用量可能记在同系列别名下面
+    const candidates = isStepFunProvider(providerID)
+      ? [providerID, "stepfun", "step", "stepfun-step-plan"]
+      : [providerID]
+    const key = candidates.find((candidate) => usage[candidate]) ?? providerID
+    usage[key] = { ...(usage[key] ?? {}), totalTokens: 0, tokensResetAt: Date.now() }
+    const tmpFile = `${DATA_FILE}.${process.pid}.tmp`
+    writeFileSync(tmpFile, JSON.stringify(file, null, 2))
+    renameSync(tmpFile, DATA_FILE)
+    return true
+  } catch {
+    return false
+  }
+}
+
 // ============================================================================
 // 国际化（i18n）
 // ============================================================================
@@ -534,6 +563,10 @@ interface Strings {
   setThresholdDesc: (current: number) => string
   invalidThreshold: string
   thresholdSet: (n: number) => string
+  resetTokensTitle: string
+  resetTokensHint: string
+  resetTokensDone: (name: string) => string
+  resetTokensFailed: string
   alertTitle: string
   alertMessage: (name: string, pct: number, threshold: number) => string
 }
@@ -594,6 +627,10 @@ function makeStrings(lang: Lang): Strings {
         setThresholdDesc: (current: number) => `当前阈值 ${current}%。达到或超过该百分比时提醒（系统通知 + 声音）。`,
         invalidThreshold: "请输入 1~100 之间的数字",
         thresholdSet: (n: number) => `用量提醒阈值已设为 ${n}%`,
+        resetTokensTitle: "清零 Token 用量",
+        resetTokensHint: "Ctrl+Y 清零",
+        resetTokensDone: (name: string) => `${name} 的 Token 数已清零`,
+        resetTokensFailed: "写入用量数据文件失败，未清零",
         alertTitle: "AI 用量提醒",
         alertMessage: (name: string, pct: number, threshold: number) =>
           `${name}：已用 ${pct.toFixed(0)}%（提醒阈值 ${threshold}%）`,
@@ -652,6 +689,10 @@ function makeStrings(lang: Lang): Strings {
         setThresholdDesc: (current: number) => `Current threshold: ${current}%. Notify (system notification + sound) when usage reaches or exceeds it.`,
         invalidThreshold: "Enter a number between 1 and 100",
         thresholdSet: (n: number) => `Alert threshold set to ${n}%`,
+        resetTokensTitle: "Reset token usage",
+        resetTokensHint: "Ctrl+Y reset",
+        resetTokensDone: (name: string) => `${name} token count reset to 0`,
+        resetTokensFailed: "Failed to write the usage data file, not reset",
         alertTitle: "AI usage alert",
         alertMessage: (name: string, pct: number, threshold: number) =>
           `${name}: ${pct.toFixed(0)}% used (threshold ${threshold}%)`,
@@ -1017,12 +1058,13 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
     <text fg={theme().borderSubtle}>{"─".repeat(24)}</text>
   )
 
-  // fmtTokens: 把 token 数格式化成易读形式
-  //   例：fmtTokens(123456) → "123.5k"
+  // fmtTokens: 把 token 数格式化成带单位的易读形式
+  //   例：fmtTokens(123456) → "123.5K"，fmtTokens(1230000) → "1.2M"
   const fmtTokens = (n: number) => {
+    if (n >= 1e12) return (n / 1e12).toFixed(1) + "T"
     if (n >= 1e9) return (n / 1e9).toFixed(1) + "B"
     if (n >= 1e6) return (n / 1e6).toFixed(1) + "M"
-    if (n >= 1e3) return (n / 1e3).toFixed(1) + "k"
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + "K"
     return String(n)
   }
 
@@ -1210,7 +1252,12 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang }) {
       </Show>
 
       <Show when={pu?.totalTokens != null}>
-        {InfoRow(t.tokens, pu!.totalTokens!.toLocaleString())}
+        {/* Token 数可以按快捷键清零，右侧给出提示 */}
+        <box flexDirection="row" gap={1}>
+          <text fg={theme().textMuted}>{padLabel(t.tokens)}</text>
+          <text fg={theme().text}>{fmtTokens(pu!.totalTokens!)}</text>
+          <text fg={theme().textMuted}>· {t.resetTokensHint}</text>
+        </box>
       </Show>
 
     </box>
@@ -1705,6 +1752,26 @@ const TuiPlugin = Plugin.define({
       }
     }
 
+    // 侧边栏最近一次渲染的会话 ID：快捷键回调在 setup 里注册，拿不到 slot 的入参，
+    // 用它反查"当前会话正在使用哪个提供商"。
+    let activeSessionID: string | undefined
+
+    // Ctrl+Y：清零当前提供商累计的 Token 数
+    const resetActiveProviderTokens = () => {
+      const providerID = getActiveProviderId(api, activeSessionID)
+      if (!providerID) {
+        context.ui.toast.show({ variant: "warning", message: t.noActiveProvider })
+        return
+      }
+      const meta = PROVIDER_META.find((m) => m.id === providerID)
+      const name = meta?.name ?? DISPLAY_NAMES[providerID] ?? providerID
+      if (resetProviderTokens(providerID)) {
+        context.ui.toast.show({ variant: "success", message: t.resetTokensDone(name) })
+      } else {
+        context.ui.toast.show({ variant: "error", message: t.resetTokensFailed })
+      }
+    }
+
     // Keymap layers are Solid component APIs in V2. Register this layer from
     // an app slot render, where OpenCode has installed Keymap.Provider, rather
     // than from setup() (which runs outside the component tree).
@@ -1724,6 +1791,16 @@ const TuiPlugin = Plugin.define({
               palette: true,
               run: () => { void openThresholdDialog() },
             },
+            {
+              id: "oc-plugin-usage.reset-tokens",
+              title: t.resetTokensTitle,
+              description: t.resetTokensHint,
+              group: "Usage",
+              // Ctrl+T 被内置的"切换模型变体"占用，这里用空闲的 Ctrl+Y
+              bind: "ctrl+y",
+              palette: true,
+              run: () => resetActiveProviderTokens(),
+            },
           ],
         }))
         return null
@@ -1734,15 +1811,17 @@ const TuiPlugin = Plugin.define({
     // 这样切换会话时侧边栏会跟着重新绑定。
     const unregisterContent = context.ui.slot({
       append: "sidebar.content",
-      render: (input: { sessionID: string }) => (
-        <UsageSidebar api={api} sessionId={input.sessionID} lang={lang} />
-      ),
+      render: (input: { sessionID: string }) => {
+        activeSessionID = input.sessionID
+        return <UsageSidebar api={api} sessionId={input.sessionID} lang={lang} />
+      },
     })
     const unregisterFooter = context.ui.slot({
       append: "sidebar.footer",
-      render: (input: { sessionID: string }) => (
-        <UsageStatusBar api={api} sessionId={input.sessionID} lang={lang} />
-      ),
+      render: (input: { sessionID: string }) => {
+        activeSessionID = input.sessionID
+        return <UsageStatusBar api={api} sessionId={input.sessionID} lang={lang} />
+      },
     })
 
     return () => {

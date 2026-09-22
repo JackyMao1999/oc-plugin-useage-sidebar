@@ -95,6 +95,9 @@ interface ProviderUsage {
   limit?: number | null;
   remaining?: number;
   totalTokens?: number;
+  // TUI 侧按快捷键清零 Token 时写入的时间戳（毫秒）。服务端读到更新的标记后
+  // 会把内存里的累计值一起清零，避免"数字取较大值"的合并逻辑把旧值写回来。
+  tokensResetAt?: number;
   lastChecked?: string;
   dailyCosts?: Record<string, number>;
   recentEvents?: Array<{ time: number; cost: number }>;
@@ -636,19 +639,67 @@ export function mergeUsageData(disk: UsageData | null, ours: UsageData): UsageDa
   };
 }
 
+// ============================================================================
+// Token 清零（TUI 侧按快捷键写入标记，服务端在这里落实）
+// ----------------------------------------------------------------------------
+// 侧边栏的 "Token数" 是插件自己累计出来的（不是服务端给的累计值），所以清零要
+// 两边配合：TUI 把文件里的 totalTokens 写 0 并打上 tokensResetAt 时间戳，服务端
+// 读到比记录更新的标记后，把内存里的累计值也一起清零。
+// ============================================================================
+
+// 每个 provider 已经应用过的清零标记，避免插件重启后又清一次（磁盘上的
+// totalTokens 那时已经是清零后的值，再清一次就会丢掉重启后新累计的量）
+const appliedTokenResets = new Map<string, number>();
+
+function tokenResetStamp(pu: unknown): number {
+  const n = Number((pu as ProviderUsage | undefined)?.tokensResetAt);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/**
+ * 把磁盘上的清零标记落实到内存数据上。
+ * - adopt = true：只登记当前标记（插件启动时调用，表示"这些标记我已经是清零后的状态"）
+ * - adopt = false：标记比记录更新时，把该 provider 的 totalTokens 归零
+ * 返回是否真的清零了（调用方据此 markDirty 落盘）。
+ */
+export function applyTokenResets(disk: UsageData | null, data: UsageData, adopt: boolean): boolean {
+  const diskUsage = disk?.providerUsage;
+  if (!diskUsage || typeof diskUsage !== "object") return false;
+  let changed = false;
+  for (const [providerID, value] of Object.entries(diskUsage)) {
+    const stamp = tokenResetStamp(value);
+    if (stamp <= 0) continue;
+    if (stamp <= (appliedTokenResets.get(providerID) ?? 0)) continue;
+    appliedTokenResets.set(providerID, stamp);
+    if (adopt) continue;
+    const pu = data.providerUsage[providerID];
+    if (!pu) continue;
+    pu.totalTokens = 0;
+    // 标记也要跟着合并（数字取较大值），否则旧实例先落盘时会把标记抹掉
+    pu.tokensResetAt = stamp;
+    changed = true;
+  }
+  return changed;
+}
+
+
 function saveData(filePath: string, data: UsageData): void {
   const dirPath = dirname(filePath);
   if (!existsSync(dirPath)) mkdirSync(dirPath, { recursive: true });
   data.lastUpdated = new Date().toISOString();
 
-  let merged: UsageData = data;
+  let disk: UsageData | null = null;
   try {
-    if (existsSync(filePath)) {
-      merged = mergeUsageData(JSON.parse(readFileSync(filePath, "utf-8")) as UsageData, data);
-    }
+    if (existsSync(filePath)) disk = JSON.parse(readFileSync(filePath, "utf-8")) as UsageData;
   } catch {
     // 磁盘内容损坏时直接写我们的
   }
+
+  // 先应用 TUI 侧写入的清零标记，再合并：不然 mergeValue 的"数字取较大值"
+  // 会把刚清零的 totalTokens 恢复成内存里的旧值。
+  if (disk) applyTokenResets(disk, data, false);
+
+  const merged: UsageData = disk ? mergeUsageData(disk, data) : data;
 
   // 原子写：先写临时文件再 rename，避免 TUI 读到写了一半的 JSON（会瞬间清零）
   const tmpPath = `${filePath}.${process.pid}.tmp`;
@@ -725,6 +776,16 @@ function formatStats(stats: ReturnType<typeof aggregate>, period: string): strin
 
 function formatDurationMs(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
+}
+
+// 把 token 数格式化成带单位的易读形式：1.2K / 3.4M / 5.6B / 7.8T
+function formatTokens(n: number): string {
+  if (!Number.isFinite(n)) return String(n);
+  if (n >= 1e12) return `${(n / 1e12).toFixed(1)}T`;
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+  return String(n);
 }
 
 // Step Plan Credit 的展示单位与账户页一致：接口返回微 credit（1e6 = 1 credit），
@@ -818,7 +879,7 @@ function formatProviderUsage(pu: ProviderUsage, label: string): string {
     lines.push(`  Monthly:    ${fmt(pu.goWindows.monthly)}`);
   } else {
     if (pu.cost != null) lines.push(`  Cost:       $${pu.cost.toFixed(2)}`);
-    if (pu.totalTokens != null) lines.push(`  Tokens:     ${pu.totalTokens.toLocaleString()}`);
+    if (pu.totalTokens != null) lines.push(`  Tokens:     ${formatTokens(pu.totalTokens)}`);
     if (pu.limit != null) lines.push(`  Limit:      $${pu.limit}`);
     if (pu.remaining != null) lines.push(`  Remaining:  $${pu.remaining.toFixed(2)}`);
     if (pu.limit != null && pu.cost != null && pu.limit > 0) {
@@ -1088,6 +1149,8 @@ const UsagePlugin = Plugin.define({
   const opts = (ctx.options || {}) as PluginOptions;
   const dataFile = join(homedir(), ".opencode", CONFIG.dataFileName);
   const data = loadData(dataFile);
+  // 文件里已有的清零标记只登记、不重复清零（磁盘上的 totalTokens 已经是清零后的值）
+  applyTokenResets(data, data, true);
   let unsaved = false;
 
   // ready：setup 完整跑完之前，所有定时器都不干活。
@@ -1110,7 +1173,21 @@ const UsagePlugin = Plugin.define({
     unsaved = true;
   }
 
+  // 检查 TUI 侧是否按快捷键清零了 Token：发现更新的标记就把内存里的累计值归零，
+  // 并立刻落盘（不等下一个 usage 事件），这样侧边栏看到的 0 不会被旧值覆盖。
+  const syncTokenResets = () => {
+    let disk: UsageData | null = null;
+    try {
+      if (!existsSync(dataFile)) return;
+      disk = JSON.parse(readFileSync(dataFile, "utf-8")) as UsageData;
+    } catch {
+      return;
+    }
+    if (applyTokenResets(disk, data, false)) markDirty();
+  };
+
   addInterval(() => {
+    syncTokenResets();
     if (unsaved) {
       saveData(dataFile, data);
       unsaved = false;

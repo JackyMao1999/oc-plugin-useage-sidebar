@@ -9,6 +9,7 @@ AI model usage monitoring plugin for [opencode](https://opencode.ai). Tracks ses
 - **Follows the active model** — the sidebar shows exactly one provider: the one in use. Picking a model in `/models` switches it immediately: OpenCode only persists the choice on the next prompt, so the plugin follows `~/.local/state/opencode/model.json` to switch right away
 - **Session cache hit rate** — live `cache read / (input + read)` for the current session (Hit rate, Input, Read, Write)
 - **Response speed** — tracks time to first token (TTFT) and output throughput (Tokens/s); the sidebar shows current-session averages, while `usage_stats` shows persisted totals
+- **Resettable token counter** — the sidebar's token count is accumulated by the plugin; press `Ctrl+Y` (or run "Reset token usage" from the command palette) to zero the current provider's count, after which it accumulates again from zero
 - **Go plan usage** — official API percent windows (rolling 5h / weekly / monthly) with reset countdown
 - **ChatGPT usage** — reads `wham/usage` and `wham/usage/credit-usage-events` from the ChatGPT backend for plan type, rate-limit windows (5h / weekly / monthly, picked from `limit_window_seconds` so whichever windows the account has are labelled correctly), remaining Credits, and the same 7-day Codex/Work Credits totals shown by Codex Cloud Analytics. Works with the standard OpenAI OAuth login — no API key needed; the plugin reads the credential from OpenCode V2's credential store and never refreshes the one-time OpenAI refresh token itself
 - **TokenRhythm account** — when the active provider is `tokenrhythm`, shows the actual available balance (实际可用总额) and cumulative cost (累计成本) from tokenrhythm.studio — the same numbers as the account page. Requires a browser session cookie (see below)
@@ -187,6 +188,38 @@ each poll, uses it only for these requests, and never writes it or the API key
 to the usage JSON. When the session expires the sidebar shows a "cookie expired"
 hint and keeps the last values until you update the file. You can alternatively
 pass the cookie as `stepfunCookie`.
+
+## Shortcuts and sounds
+
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+O` | Set the usage alert threshold (also in the command palette: "Set usage alert threshold") |
+| `Ctrl+Y` | Reset the active provider's token count (also in the command palette: "Reset token usage") |
+
+The reset only affects the accumulated token counter shown in the sidebar (the same
+number as `Tokens` in `usage_stats`); costs, balances, and plan windows are untouched.
+The TUI writes a `tokensResetAt` marker that the server-side plugin applies, so the
+"keep the larger number" merge used for the shared data file can't restore the old value.
+
+### Sound when input is needed / a turn finishes
+
+These are played by OpenCode's built-in attention plugin (`permission.asked` → permission
+sound; session done → done, subagents → subagent_done). They are **off by default**; enable
+them in `~/.config/opencode/cli.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/v2/cli.json",
+  "attention": {
+    "sound": true,
+    "volume": 0.5
+  }
+}
+```
+
+- `sound: true` plays sounds; add `notifications: true` to also show system notifications
+- `sounds` overrides individual events: `{ "permission": "/path/to/x.wav", "done": "/path/to/y.wav" }`
+- Restart the TUI after changing `cli.json` (the TUI process reads it at startup)
 
 ## Options
 
