@@ -10,7 +10,7 @@ AI model usage monitoring plugin for [opencode](https://opencode.ai). Tracks ses
 - **Session cache hit rate** — live `cache read / (input + read)` for the current session (Hit rate, Input, Read, Write)
 - **Response speed** — tracks time to first token (TTFT) and output throughput (Tokens/s); the sidebar shows current-session averages, while `usage_stats` shows persisted totals
 - **Resettable token counter** — the sidebar's token count is accumulated by the plugin; press `Ctrl+Y` (or run "Reset token usage" from the command palette) to zero the current provider's count, after which it accumulates again from zero
-- **Session status panel (cross-window)** — a framed list of every session with a status symbol: `?` needs input (permission/form), `↻` retrying, `●` working, `○` idle (the current session is marked with `›`; idle subagent sessions are hidden and idle sessions older than 30 minutes drop off). The list, running state, and pending-input counts all come from the background service that every window shares, so **a window opened later still sees sessions that started earlier, even in other directories**; it refreshes every 5s and immediately on related events. Click the header to collapse, or turn the whole panel off with `sessionsPanel: false`
+- **Session status panel (cross-window)** — a framed list of every session, with the state carried entirely by a leading symbol plus colour (the sidebar is narrow, so trailing status text gets clipped): `?` needs input (permission/form, yellow warning, title tinted too), `↻` retrying (yellow), `●` working (accent), `○` idle (grey, whole row dimmed); the current session is marked with `›`. Only when a `?`, `↻` or `●` row is present does the box add a compact parenthesised legend at the bottom (idle is the default state and its row is grey, so it is left out to avoid looking like another session). Idle subagent sessions are hidden, and idle sessions drop off after 2 hours by default (tabs open in this window, the current session, and active/needs-input sessions are exempt); tune it with `sessionsIdleMinutes` (`0` = only active and needs-input sessions). The list, running state, and pending-input counts all come from the background service that every window shares, so **a window opened later still sees sessions that started earlier, even in other directories**; it refreshes every 5s and immediately on related events. If the server list cannot be fetched, the box shows "This window only" in yellow to say the panel fell back to local data. Click the header to collapse, or turn the whole panel off with `sessionsPanel: false`
 - **Cross-session toasts** — when a session in another OpenCode window finishes a task, asks for permission, or needs a choice, the current window shows a toast (the toast title is the session name; events are broadcast by the shared service, so sessions in other directories notify too). The session you are already watching is not re-announced; disable with `sessionToasts: false`
 - **Go plan usage** — official API percent windows (rolling 5h / weekly / monthly) with reset countdown
 - **ChatGPT usage** — reads `wham/usage` and `wham/usage/credit-usage-events` from the ChatGPT backend for plan type, rate-limit windows (5h / weekly / monthly, picked from `limit_window_seconds` so whichever windows the account has are labelled correctly), remaining Credits, and the same 7-day Codex/Work Credits totals shown by Codex Cloud Analytics. Works with the standard OpenAI OAuth login — no API key needed; the plugin reads the credential from OpenCode V2's credential store and never refreshes the one-time OpenAI refresh token itself
@@ -105,8 +105,9 @@ Quit every opencode client, then run:
 opencode service restart
 ```
 
-Reopen `opencode` and the right sidebar will show
-**Usage → Session Cache → Providers**.
+Reopen `opencode` and the right sidebar will show three sections, each one a
+collapsible header row above a rounded content box:
+**💾 Session Cache → 📋 Sessions → 🌐 Providers**.
 
 ### Workspace / Go plan
 
@@ -237,6 +238,7 @@ them in `~/.config/opencode/cli.json`:
 | `usageThresholdPercent` | `number` | `80` | Percentage at which toast warning fires |
 | `sessionsPanel` | `boolean` | `true` | Show the "Sessions" status panel in the sidebar (the header also collapses on click) |
 | `sessionToasts` | `boolean` | `true` | Toast when another session finishes, asks for permission, or needs input |
+| `sessionsIdleMinutes` | `number` | `120` | How long (minutes) an idle session stays listed; `0` shows only active/needs-input sessions |
 | `language` (tui plugin) | `string` | `en` | Sidebar language: `en` or `zh` |
 
 ## Data collected

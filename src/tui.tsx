@@ -460,9 +460,10 @@ const DISPLAY_NAMES: Record<string, string> = {
   "stepfun-step-plan": "StepFun",
 }
 
-// 会话面板里"空闲"会话的保留窗口：只列出最近 30 分钟内活跃过的空闲会话，
-// 否则时间一长面板会变成陈年会话清单（运行中/待确认的会话不受此限制）
-const SESSION_IDLE_WINDOW_MS = 30 * 60 * 1000
+// 会话面板里"空闲"会话的默认保留窗口：列出最近 2 小时内活跃过（或本窗口打开着）的空闲会话，
+// 否则时间一长面板会变成陈年会话清单（运行中/待确认/当前会话/本窗口标签页不受此限制）。
+// 可用插件选项 sessionsIdleMinutes 调整（0 = 只看活跃与待确认的会话）
+const SESSION_IDLE_WINDOW_MS = 120 * 60 * 1000
 
 const STEPFUN_PROVIDER_IDS = new Set(["stepfun", "step", "stepfun-step-plan"])
 function isStepFunProvider(providerID: string): boolean {
@@ -564,11 +565,11 @@ interface Strings {
   sessions: string
   noSessions: string
   statusBusy: string
-  statusIdle: string
   statusRetry: string
   statusNeedsInput: string
   sessionUntitled: string
   sessionsMore: (n: number) => string
+  sessionsOffline: string
   toastDone: string
   toastPermission: string
   toastForm: string
@@ -639,11 +640,11 @@ function makeStrings(lang: Lang): Strings {
         sessions: "会话",
         noSessions: "没有运行中的会话",
         statusBusy: "运行中",
-        statusIdle: "空闲",
         statusRetry: "重试中",
         statusNeedsInput: "待确认",
         sessionUntitled: "未命名会话",
         sessionsMore: (n: number) => `还有 ${n} 个会话`,
+        sessionsOffline: "仅本窗口会话",
         toastDone: "任务完成",
         toastPermission: "需要授权确认",
         toastForm: "需要你的选择",
@@ -712,11 +713,11 @@ function makeStrings(lang: Lang): Strings {
         sessions: "Sessions",
         noSessions: "No sessions running",
         statusBusy: "Working",
-        statusIdle: "Idle",
         statusRetry: "Retrying",
         statusNeedsInput: "Needs input",
         sessionUntitled: "Untitled session",
         sessionsMore: (n: number) => `${n} more session${n > 1 ? "s" : ""}`,
+        sessionsOffline: "This window only",
         toastDone: "Task finished",
         toastPermission: "Permission needed",
         toastForm: "Input needed",
@@ -807,12 +808,12 @@ function legacyTheme(theme: any) {
  *   - api.state.session : 当前会话的数据
  *   - api.client        : opencode 的 SDK 客户端（可以调用 API）
  *
- * 组件渲染的 UI 结构（从上到下）：
- *   ▼ Usage（总开关）
- *     ▼ Session Cache ← 当前会话的缓存命中率
- *     ▼ Providers     ← OpenAI/Anthropic/Go/Zen 的费用和进度条
+ * 组件渲染的 UI 结构（从上到下，每个区块都是"可点击的标题行 + 圆角方框内容"）：
+ *   ▼ Session Cache ← 当前会话的缓存命中率
+ *   ▼ Sessions      ← 所有窗口/目录的会话及状态
+ *   ▼ Providers     ← OpenAI/Anthropic/Go/Zen 的费用和进度条
  */
-function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSessions?: boolean }) {
+function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSessions?: boolean; sessionsIdleMs?: number }) {
   // t : 当前语言的界面文案（en 或 zh，由插件 options.language 控制）
   const t = makeStrings(props.lang ?? "en")
 
@@ -826,12 +827,11 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
   //              每 30 秒自动重新读取一次
   const [data, setData] = createSignal(loadData())
 
-  // 以下 3 个状态控制各个区域的折叠/展开
+  // 以下 3 个状态控制各个区域的折叠/展开（每个区块各自套一个方框，没有外层总开关）
   // true = 展开（可见）, false = 折叠（隐藏）
-  const [open, setOpen] = createSignal(true)              // Usage 总标题
   const [openCache, setOpenCache] = createSignal(true)    // Session Cache 区域（默认展开）
+  const [openSessions, setOpenSessions] = createSignal(true)   // Sessions 区域（默认展开）
   const [openProviders, setOpenProviders] = createSignal(true) // Providers 区域（默认展开）
-  const [openSessions, setOpenSessions] = createSignal(true)   // Sessions 区域（默认展开，可点击折叠）
 
   // 所有 provider 用量都由服务端插件（index.ts）采集后写进 JSON 文件：
   //   Go / Zen 套餐 → providerUsage["opencode-go"].goApi
@@ -926,19 +926,26 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
   })
 
   // sessionRows : 所有会话的状态列表（会话面板的数据源）
-  //   符号含义：? 待确认（授权/表单）、↻ 重试中、● 运行中、○ 空闲
+  //   状态全部靠"行首符号 + 颜色"表达（侧边栏很窄，行尾再挂状态文字会被裁掉）：
+  //     ? 待确认（授权/表单，warning 色，标题同为 warning）
+  //     ↻ 重试中（warning）
+  //     ● 运行中（accent）
+  //     ○ 空闲（muted，标题也淡掉）
   //   排序：待确认 > 运行中/重试 > 空闲，同组内按最近更新时间
   const sessionRows = createMemo(() => {
     if (props.showSessions === false) return []
     props.api.state.revision?.()
     const list = (props.api.state.sessions?.() ?? []) as any[]
     const currentID = props.sessionId
+    // 本窗口打开的标签页会话：空闲也要列（它们确实开着）
+    const tabIDs = (props.api.state.tabSessionIDs?.() ?? []) as string[]
+    const idleWindowMs = props.sessionsIdleMs ?? SESSION_IDLE_WINDOW_MS
     const rows: Array<{
       id: string
       title: string
       glyph: string
       color: string
-      statusText: string
+      titleColor: string
       current: boolean
       rank: number
       updated: number
@@ -952,22 +959,25 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
       const child = Boolean(info.parentID)
       // 子会话只在真正干活/等人时才列出，避免刷屏
       if (child && !needsInput && !busy && !retry) continue
-      const updated = Number(info.time?.updated) || 0
+      // "最近活动"取 updated 和 viewed 的较新值：会话可能只是被打开看过、还没有新消息
+      const updated = Math.max(Number(info.time?.updated) || 0, Number(info.time?.viewed) || 0)
       const idle = !needsInput && !busy && !retry
-      // 空闲会话只保留最近活跃的（以及当前正在看的那个）
-      if (idle && info.id !== currentID && Date.now() - updated > SESSION_IDLE_WINDOW_MS) continue
+      // 空闲会话保留：最近活跃/查看过的、当前正在看的、以及本窗口打开的标签页
+      const openedHere = tabIDs.includes(info.id)
+      if (idle && !openedHere && info.id !== currentID && Date.now() - updated > idleWindowMs) continue
       const title = String(info.title ?? "").trim() || t.sessionUntitled
-      const label = child ? `└ ${title}` : title
-      if (needsInput) {
-        // 需要用户操作：最高优先级，用问号标出
-        rows.push({ id: info.id, title: label, glyph: "?", color: theme().warning, statusText: t.statusNeedsInput, current: info.id === currentID, rank: 3, updated: Number(info.time?.updated) || 0 })
-      } else if (retry) {
-        rows.push({ id: info.id, title: label, glyph: "↻", color: theme().warning, statusText: t.statusRetry, current: info.id === currentID, rank: 2, updated: Number(info.time?.updated) || 0 })
-      } else if (busy) {
-        rows.push({ id: info.id, title: label, glyph: "●", color: theme().accent, statusText: t.statusBusy, current: info.id === currentID, rank: 2, updated: Number(info.time?.updated) || 0 })
-      } else {
-        rows.push({ id: info.id, title: label, glyph: "○", color: theme().textMuted, statusText: "", current: info.id === currentID, rank: 1, updated: Number(info.time?.updated) || 0 })
-      }
+      const isCurrent = info.id === currentID
+      rows.push({
+        id: info.id,
+        title: child ? `└ ${title}` : title,
+        glyph: needsInput ? "?" : retry ? "↻" : busy ? "●" : "○",
+        color: needsInput || retry ? theme().warning : busy ? theme().accent : theme().textMuted,
+        // 待确认最显眼（warning），正在看的会话用强调色，空闲的整行淡掉
+        titleColor: needsInput ? theme().warning : isCurrent ? theme().accent : idle ? theme().textMuted : theme().text,
+        current: isCurrent,
+        rank: needsInput ? 3 : busy || retry ? 2 : 1,
+        updated,
+      })
     }
     rows.sort((a, b) => b.rank - a.rank || b.updated - a.updated)
     return rows
@@ -977,6 +987,18 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
   const SESSION_ROW_LIMIT = 10
   const visibleSessionRows = createMemo(() => sessionRows().slice(0, SESSION_ROW_LIMIT))
   const hiddenSessionCount = createMemo(() => Math.max(0, sessionRows().length - SESSION_ROW_LIMIT))
+
+  // 符号图例：只解释"需要留意"的状态（? 待确认 / ↻ 重试中 / ● 运行中），
+  // 空闲（○）是默认状态且整行是灰的，不列出来——否则用户会把图例当成一条会话。
+  // 最多两条，避免侧边栏太窄被裁掉。
+  const sessionLegend = createMemo(() => {
+    const rows = sessionRows()
+    const parts: string[] = []
+    if (rows.some((row) => row.rank === 3)) parts.push(`? ${t.statusNeedsInput}`)
+    if (rows.some((row) => row.glyph === "↻")) parts.push(`↻ ${t.statusRetry}`)
+    if (rows.some((row) => row.glyph === "●")) parts.push(`● ${t.statusBusy}`)
+    return parts.slice(0, 2).join(" · ")
+  })
 
   // goUsage : 服务端插件写入的官方 /zen/go/v1/usage 快照，没有才回退到本地累计的 goWindows
   const goUsage = createMemo(() => providers()["opencode-go"]?.goApi ?? null)
@@ -1158,11 +1180,6 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
     </box>
   )
 
-  // divider: 区域之间的分隔线
-  const divider = () => (
-    <text fg={theme().borderSubtle}>{"─".repeat(24)}</text>
-  )
-
   // fmtTokens: 把 token 数格式化成带单位的易读形式
   //   例：fmtTokens(123456) → "123.5K"，fmtTokens(1230000) → "1.2M"
   const fmtTokens = (n: number) => {
@@ -1216,7 +1233,7 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
     // StepFun 余额由服务端插件轮询后写入数据文件
     const sf = isStepFunProvider(id) ? pu?.stepfun : undefined
     return (
-    <box paddingLeft={2}>
+    <box paddingLeft={1}>
       <Show when={id === "opencode-go" && goUsage()}>
         {InfoRow(t.plan, "Go")}
         {GoWindowPercent(t.rolling5h, goUsage()!.rolling)}
@@ -1373,145 +1390,153 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
   // 从 <box> 开始一直到 </box>，就是整个侧边栏面板的 UI
 
 return (
-    <box>
-      <box flexDirection="row" gap={1} onMouseDown={() => setOpen((x) => !x)}>
-        {label(open())}
-        <text fg={theme().text}><b>⚡ {t.usage}</b></text>
-      </box>
-      <Show when={open()}>
-        <box paddingLeft={1}>
-
-          <box flexDirection="row" gap={1} onMouseDown={() => setOpenCache((x) => !x)}>
-            {label(openCache())}
-            <text fg={theme().text}><b>💾 {t.sessionCache}</b></text>
-          </box>
-
-          <Show when={openCache() && cacheStats().turns > 0}>
-            <box paddingLeft={2}>
-              {BarRow(t.hitRate, cacheStats().hit, cacheColor(cacheStats().hit))}
-              {InfoRow(t.input, fmtTokens(cacheStats().input))}
-              {InfoRow(t.output, fmtTokens(cacheStats().output))}
-              {InfoRow(t.read, fmtTokens(cacheStats().read))}
-              {InfoRow(t.write, fmtTokens(cacheStats().write))}
-              <Show when={responseStats().turns > 0}>
-                {InfoRow(t.ttft, fmtDurationMs(responseStats().ttftMs / responseStats().turns))}
-              </Show>
-              <Show when={responseStats().outputTokens > 0 && responseStats().generationMs > 0}>
-                {InfoRow(
-                  t.tokensPerSecond,
-                  fmtTokensPerSecond(responseStats().outputTokens / (responseStats().generationMs / 1000)),
-                )}
-              </Show>
-            </box>
-          </Show>
-          {/* 上面的命中率经 BarRow 用 fmtPct 格式化：整数不带 .0 */}
-
-          <Show when={openCache() && cacheStats().turns === 0}>
-            <text fg={theme().textMuted} paddingLeft={2}>
-              {t.noTurns}
-            </text>
-          </Show>
-
-          {divider()}
-
-          <box flexDirection="row" gap={1} onMouseDown={() => setOpenSessions((x) => !x)}>
-            {label(openSessions())}
-            <text fg={theme().text}><b>🗂 {t.sessions}</b></text>
-            <text fg={theme().textMuted}>({sessionRows().length})</text>
-          </box>
-          <Show when={openSessions()}>
-            <box paddingLeft={2}>
-              <Show when={sessionRows().length === 0}>
-                <text fg={theme().textMuted}>{t.noSessions}</text>
-              </Show>
-              <Show when={sessionRows().length > 0}>
-                {/* 用方框把会话列表圈起来，符号表示状态（见 sessionRows 注释） */}
-                <box
-                  border
-                  borderStyle="rounded"
-                  borderColor={theme().borderSubtle}
-                  flexDirection="column"
-                  paddingLeft={1}
-                  paddingRight={1}
-                >
-                  <For each={visibleSessionRows()}>
-                    {(row) => (
-                      <box flexDirection="row" gap={1}>
-                        <text fg={row.color}>{row.glyph}</text>
-                        <text fg={row.current ? theme().accent : theme().text}>
-                          {row.current ? "› " : "  "}{truncate(row.title, 18)}
-                        </text>
-                        <Show when={row.statusText}>
-                          <text fg={row.color}>{row.statusText}</text>
-                        </Show>
-                      </box>
-                    )}
-                  </For>
-                  <Show when={hiddenSessionCount() > 0}>
-                    <text fg={theme().textMuted}>{t.sessionsMore(hiddenSessionCount())}</text>
-                  </Show>
-                </box>
-              </Show>
-            </box>
-          </Show>
-
-          <box flexDirection="row" gap={1} onMouseDown={() => setOpenProviders((x) => !x)}>
-            {label(openProviders())}
-            <text fg={theme().text}><b>🌐 {t.providers}</b></text>
-          </box>
-          <Show when={openProviders()}>
-            <Show when={knownProviders().length === 0}>
-              <text fg={theme().textMuted} paddingLeft={2}>{t.noActiveProvider}</text>
-            </Show>
-            <For each={knownProviders()}>
-              {(p) => (
-                <box paddingLeft={2}>
-                  {/* 徽标 + 名称 + 状态 */}
-                  <box flexDirection="row" gap={1}>
-                    <text fg={p.color}>{p.glyph}</text>
-                    <text fg={p.active ? theme().accent : theme().text}>
-                      <b>{p.name}</b>
-                    </text>
-                    <box flexGrow={1} />
-                    <text fg={p.active ? theme().accent : p.configured ? theme().success : theme().textMuted}>
-                      {p.active ? t.inUse : p.configured ? t.configured : t.notConfigured}
-                    </text>
-                  </box>
-                  {/* 当前使用的提供商显示明细（数据来自服务端插件写入的 JSON 文件） */}
-                  <Show when={p.pu || (p.id === "opencode-go" && goUsage())}>
-                    {ProviderDetails(p.id, p.pu)}
-                  </Show>
-                  {/* 切换到这个供应商但还没有采集到用量时给个明确提示，避免看起来像"没切换" */}
-                  <Show when={!p.pu && !(p.id === "opencode-go" && goUsage())}>
-                    <text fg={theme().textMuted} paddingLeft={2}>{t.noData}</text>
-                  </Show>
-                </box>
-              )}
-            </For>
-
-            {/* 提醒阈值：只显示数值，不绘制进度条 */}
-            <box flexDirection="row" gap={1} paddingLeft={2}>
-              <text fg={theme().textMuted}>{padLabel(t.threshold)}</text>
-              <text fg={theme().accent}><b>{fmtPct(threshold())}%</b></text>
-              <text fg={theme().textMuted}>· {thresholdKeyHint}</text>
-            </box>
-
-            {/* Go 数据在显示时，用真正的 API 拉取时间；否则用数据文件的保存时间 */}
-            <Show when={goUsage() && goUpdated()}>
-              <text fg={theme().textMuted} paddingLeft={2}>
-                {t.updated}: {new Date(goUpdated()!).toLocaleTimeString(undefined, { hour12: false })}
-              </text>
-            </Show>
-            <Show when={!goUsage() && data().lastUpdated}>
-              <text fg={theme().textMuted} paddingLeft={2}>
-                {t.updated}: {new Date(data().lastUpdated).toLocaleTimeString(undefined, { hour12: false })}
-              </text>
-            </Show>
-          </Show>
-        </box>
-      </Show>
+  <box>
+    {/* -------- 会话缓存（标题行可点，内容套一个圆角方框） -------- */}
+    <box flexDirection="row" gap={1} onMouseDown={() => setOpenCache((x) => !x)}>
+      {label(openCache())}
+      <text fg={theme().text}><b>💾 {t.sessionCache}</b></text>
     </box>
-  )
+    <Show when={openCache()}>
+      <box
+        border
+        borderStyle="rounded"
+        borderColor={theme().borderSubtle}
+        flexDirection="column"
+        paddingLeft={1}
+        paddingRight={1}
+      >
+        <Show when={cacheStats().turns > 0}>
+          {BarRow(t.hitRate, cacheStats().hit, cacheColor(cacheStats().hit))}
+          {InfoRow(t.input, fmtTokens(cacheStats().input))}
+          {InfoRow(t.output, fmtTokens(cacheStats().output))}
+          {InfoRow(t.read, fmtTokens(cacheStats().read))}
+          {InfoRow(t.write, fmtTokens(cacheStats().write))}
+          <Show when={responseStats().turns > 0}>
+            {InfoRow(t.ttft, fmtDurationMs(responseStats().ttftMs / responseStats().turns))}
+          </Show>
+          <Show when={responseStats().outputTokens > 0 && responseStats().generationMs > 0}>
+            {InfoRow(
+              t.tokensPerSecond,
+              fmtTokensPerSecond(responseStats().outputTokens / (responseStats().generationMs / 1000)),
+            )}
+          </Show>
+        </Show>
+        {/* 上面的命中率经 BarRow 用 fmtPct 格式化：整数不带 .0 */}
+        <Show when={cacheStats().turns === 0}>
+          <text fg={theme().textMuted}>{t.noTurns}</text>
+        </Show>
+      </box>
+    </Show>
+
+    {/* -------- 会话（跨窗口，符号表示状态，见 sessionRows 注释） -------- */}
+    <box flexDirection="row" gap={1} onMouseDown={() => setOpenSessions((x) => !x)}>
+      {label(openSessions())}
+      <text fg={theme().text}><b>📋 {t.sessions}</b></text>
+      <text fg={theme().textMuted}>({sessionRows().length})</text>
+    </box>
+    <Show when={openSessions()}>
+      <box
+        border
+        borderStyle="rounded"
+        borderColor={theme().borderSubtle}
+        flexDirection="column"
+        paddingLeft={1}
+        paddingRight={1}
+      >
+        {/* 服务端会话列表拉不到时明确提示：现在的列表只有本窗口的会话 */}
+        <Show when={props.api.state.serverSessionsOK?.() === false}>
+          <text fg={theme().warning}>{t.sessionsOffline}</text>
+        </Show>
+        <Show when={sessionRows().length === 0}>
+          <text fg={theme().textMuted}>{t.noSessions}</text>
+        </Show>
+        <For each={visibleSessionRows()}>
+          {(row) => (
+            <box flexDirection="row" gap={1}>
+              {/* 状态看行首符号 + 颜色：? 待确认（warning） / ↻ 重试中（warning）
+                  ● 运行中（accent） / ○ 空闲（muted）；行尾不再挂文字，避免被裁掉 */}
+              <text fg={row.color}>{row.glyph}</text>
+              <text fg={row.titleColor}>
+                {row.current ? "› " : "  "}{truncate(row.title, 18)}
+              </text>
+            </box>
+          )}
+        </For>
+        <Show when={hiddenSessionCount() > 0}>
+          <text fg={theme().textMuted}>{t.sessionsMore(hiddenSessionCount())}</text>
+        </Show>
+        {/* 图例：加括号 + 灰色，明确它不是一条会话 */}
+        <Show when={sessionLegend()}>
+          <text fg={theme().textMuted}>({sessionLegend()})</text>
+        </Show>
+        </box>
+        </Show>
+
+    {/* -------- 提供商 -------- */}
+    <box flexDirection="row" gap={1} onMouseDown={() => setOpenProviders((x) => !x)}>
+      {label(openProviders())}
+      <text fg={theme().text}><b>🌐 {t.providers}</b></text>
+    </box>
+    <Show when={openProviders()}>
+      <box
+        border
+        borderStyle="rounded"
+        borderColor={theme().borderSubtle}
+        flexDirection="column"
+        paddingLeft={1}
+        paddingRight={1}
+      >
+        <Show when={knownProviders().length === 0}>
+          <text fg={theme().textMuted}>{t.noActiveProvider}</text>
+        </Show>
+        <For each={knownProviders()}>
+          {(p) => (
+            <box>
+              {/* 徽标 + 名称 + 状态 */}
+              <box flexDirection="row" gap={1}>
+                <text fg={p.color}>{p.glyph}</text>
+                <text fg={p.active ? theme().accent : theme().text}>
+                  <b>{p.name}</b>
+                </text>
+                <box flexGrow={1} />
+                <text fg={p.active ? theme().accent : p.configured ? theme().success : theme().textMuted}>
+                  {p.active ? t.inUse : p.configured ? t.configured : t.notConfigured}
+                </text>
+              </box>
+              {/* 当前使用的提供商显示明细（数据来自服务端插件写入的 JSON 文件） */}
+              <Show when={p.pu || (p.id === "opencode-go" && goUsage())}>
+                {ProviderDetails(p.id, p.pu)}
+              </Show>
+              {/* 切换到这个供应商但还没有采集到用量时给个明确提示，避免看起来像"没切换" */}
+              <Show when={!p.pu && !(p.id === "opencode-go" && goUsage())}>
+                <text fg={theme().textMuted}>{t.noData}</text>
+              </Show>
+            </box>
+          )}
+        </For>
+
+        {/* 提醒阈值：只显示数值，不绘制进度条 */}
+        <box flexDirection="row" gap={1}>
+          <text fg={theme().textMuted}>{padLabel(t.threshold)}</text>
+          <text fg={theme().accent}><b>{fmtPct(threshold())}%</b></text>
+          <text fg={theme().textMuted}>· {thresholdKeyHint}</text>
+        </box>
+
+        {/* Go 数据在显示时，用真正的 API 拉取时间；否则用数据文件的保存时间 */}
+        <Show when={goUsage() && goUpdated()}>
+          <text fg={theme().textMuted}>
+            {t.updated}: {new Date(goUpdated()!).toLocaleTimeString(undefined, { hour12: false })}
+          </text>
+        </Show>
+        <Show when={!goUsage() && data().lastUpdated}>
+          <text fg={theme().textMuted}>
+            {t.updated}: {new Date(data().lastUpdated).toLocaleTimeString(undefined, { hour12: false })}
+          </text>
+        </Show>
+      </box>
+    </Show>
+  </box>
+)
 }
 
 
@@ -1790,6 +1815,10 @@ function createTuiApi(context: any) {
   const pendingEvents = new Map<string, Set<string>>()
   let pendingEventTotal = 0
   const [serverPending, setServerPending] = createSignal<Record<string, number>>({})
+  // 会话列表是否真的来自服务端（false = 只有本窗口的本地数据），失败原因也记下来，
+  // 侧边栏会把它显示出来，避免"看起来少了几个会话"却查不出原因
+  const [serverSessionsOK, setServerSessionsOK] = createSignal(false)
+  const [sessionsError, setSessionsError] = createSignal("")
   let refreshingSessions = false
   let lastSessionsRefresh = 0
 
@@ -1798,25 +1827,46 @@ function createTuiApi(context: any) {
     refreshingSessions = true
     lastSessionsRefresh = Date.now()
     try {
-      const [sessions, active, permissions, forms] = await Promise.all([
-        context.client.session.list({ limit: 50 }) as Promise<any>,
-        context.client.session.active() as Promise<any>,
-        context.client.permission.request.list() as Promise<any>,
-        context.client.form.list() as Promise<any>,
+      // 用 allSettled 逐个取值：某个接口不可用时，其它数据照常更新
+      const [sessions, active, permissions, forms] = await Promise.allSettled([
+        Promise.resolve().then(() => context.client.session.list({ limit: 50 })),
+        Promise.resolve().then(() => context.client.session.active()),
+        Promise.resolve().then(() => context.client.permission.request.list()),
+        Promise.resolve().then(() => context.client.form.list()),
       ])
-      if (Array.isArray(sessions?.data)) setServerSessions(sessions.data)
+      const value = <T,>(result: PromiseSettledResult<T>): T | undefined =>
+        result.status === "fulfilled" ? result.value : undefined
+
+      const sessionList = value(sessions) as any
+      if (Array.isArray(sessionList?.data)) {
+        setServerSessions(sessionList.data)
+        setServerSessionsOK(true)
+        setSessionsError("")
+      } else {
+        setServerSessionsOK(false)
+      }
+
       // session.active() 直接返回 id→状态 的映射（不套 data 字段），这里两种形状都兼容
-      const activeMap = active?.data ?? active
+      const activeRaw = value(active) as any
+      const activeMap = activeRaw?.data ?? activeRaw
       if (activeMap && typeof activeMap === "object") setActiveSessionIDs(new Set(Object.keys(activeMap)))
+
+      const permissionsRaw = value(permissions) as any
+      const formsRaw = value(forms) as any
       const counts: Record<string, number> = {}
-      for (const item of [...(permissions?.data ?? []), ...(forms?.data ?? [])]) {
+      for (const item of [...(permissionsRaw?.data ?? []), ...(formsRaw?.data ?? [])]) {
         const sessionID = item?.sessionID
         if (sessionID) counts[sessionID] = (counts[sessionID] ?? 0) + 1
       }
       setServerPending(counts)
+
+      // 只有会话列表本身失败才提示（其它接口失败不影响会话列表）
+      if (sessions.status === "rejected") {
+        setSessionsError(String((sessions.reason as any)?.message ?? sessions.reason ?? "unknown"))
+      }
       setRevision((value) => value + 1)
-    } catch {
-      // 服务端暂时不可用时保留上一次的快照
+    } catch (error: any) {
+      setSessionsError(String(error?.message ?? error))
     } finally {
       refreshingSessions = false
     }
@@ -1956,6 +2006,17 @@ function createTuiApi(context: any) {
         }
         return activeSessionIDs().has(sessionID) ? "running" : "idle"
       },
+      // 本窗口打开的标签页：这些会话即使空闲也要列出来（它们确实"开着"）
+      tabSessionIDs: (): string[] => {
+        try {
+          return (context.ui.tabs.list() ?? []).map((tab: any) => String(tab.sessionID))
+        } catch {
+          return []
+        }
+      },
+      // 会话列表是否来自服务端（false = 只有本窗口本地数据），失败原因一并暴露给 UI
+      serverSessionsOK: () => serverSessionsOK(),
+      sessionsError: () => sessionsError(),
       // 需要用户操作的次数：服务端查询（当前目录）+ 全局事件统计，取较大值
       sessionNeedsInput: (sessionID: string): number => {
         let local = 0
@@ -1999,6 +2060,11 @@ const TuiPlugin = Plugin.define({
     // 会话面板 / 跨会话 Toast 可以用插件选项关掉（默认都开）
     const sessionsPanel = options.sessionsPanel !== false
     const sessionToasts = options.sessionToasts !== false
+    // 空闲会话的保留窗口（分钟）：0 = 只列活跃/待确认/本窗口打开的会话，
+    // 不配置则用默认值（SESSION_IDLE_WINDOW_MS，2 小时）
+    const idleMinutes = Number(options.sessionsIdleMinutes)
+    const sessionsIdleMs =
+      Number.isFinite(idleMinutes) && idleMinutes >= 0 ? idleMinutes * 60000 : undefined
     const { api, dispose: disposeApi } = createTuiApi(context)
 
     // -------- 别的会话完成任务 / 需要选择时弹 Toast --------
@@ -2127,7 +2193,15 @@ const TuiPlugin = Plugin.define({
       append: "sidebar.content",
       render: (input: { sessionID: string }) => {
         activeSessionID = input.sessionID
-        return <UsageSidebar api={api} sessionId={input.sessionID} lang={lang} showSessions={sessionsPanel} />
+        return (
+          <UsageSidebar
+            api={api}
+            sessionId={input.sessionID}
+            lang={lang}
+            showSessions={sessionsPanel}
+            sessionsIdleMs={sessionsIdleMs}
+          />
+        )
       },
     })
     const unregisterFooter = context.ui.slot({

@@ -10,7 +10,7 @@
 - **会话缓存命中率** — 实时统计当前会话的 `cache read / (input + read)`，显示 Hit rate、Input、Read、Write
 - **响应速度** — 统计首字延迟（TTFT）和输出速度（Tokens/s）；侧边栏显示当前会话平均值，`usage_stats` 显示持久化累计值
 - **Token 计数可清零** — 侧边栏的 `Token数` 是插件累计值，按 `Ctrl+Y`（或命令面板搜 "Reset token usage"）即可把当前提供商的计数归零，之后的用量重新累计
-- **会话状态面板（跨窗口）** — 用方框列出所有会话及其状态符号：`?` 待确认（授权/表单）、`↻` 重试中、`●` 运行中、`○` 空闲（当前会话用 `›` 标出；空闲的子会话不占位置，空闲会话只列最近 30 分钟活跃过的）。列表、运行状态、待确认都直接来自后台服务（所有窗口共用同一个服务），所以**后打开的窗口也能看到之前启动的、甚至别的目录里的会话**；每 5 秒刷新一次，相关事件到达时立刻刷新。点标题可折叠，也可以用 `sessionsPanel: false` 整个关掉
+- **会话状态面板（跨窗口）** — 用方框列出所有会话，状态全在**行首符号 + 颜色**上表达（侧边栏窄，行尾挂文字会被裁掉）：`?` 待确认（授权/表单，黄色 warning，标题同为黄色）、`↻` 重试中（黄色）、`●` 运行中（强调色）、`○` 空闲（灰色，整行淡掉）；当前会话用 `›` 标出。只有当面板里出现 `?` / `↻` / `●` 时，方框底部才会多一行带括号的图例（空闲是默认状态、整行是灰的，不列进图例，免得看起来像多了一条会话）。空闲的子会话不占位置；空闲会话的保留窗口默认 2 小时（本窗口打开的标签页、当前会话、活跃/待确认的会话不受限制），可用 `sessionsIdleMinutes` 调整（`0` = 只列活跃与待确认的会话）。列表、运行状态、待确认都直接来自后台服务（所有窗口共用同一个服务），所以**后打开的窗口也能看到之前启动的、甚至别的目录里的会话**；每 5 秒刷新一次，相关事件到达时立刻刷新。若服务端列表拉取失败，方框内会以黄色显示「仅本窗口会话」，表示当前只剩本窗口的本地数据。点标题可折叠，也可以用 `sessionsPanel: false` 整个关掉
 - **跨会话 Toast 提醒** — 别的 opencode 窗口里的会话完成任务（Toast 标题为会话名 + "任务完成"）、需要授权确认、或需要你选择时，当前窗口会弹 Toast（事件由后台服务广播，别的目录的会话同样能收到）；正在看的会话不重复提醒，可用 `sessionToasts: false` 关闭
 - **Go 套餐用量** — 通过官方 API 显示 Rolling 5h / Weekly / Monthly 的已用百分比 + 重置倒计时（超过 24 小时自动显示为天）
 - **ChatGPT 用量** — 读取 ChatGPT 后台的 `wham/usage` 和 `wham/usage/credit-usage-events`，显示计划类型、限额窗口（按 `limit_window_seconds` 自动识别 5 小时 / 每周 / 月度，账号有哪些窗口就显示哪些）、剩余 Credits，以及与 Codex Cloud Analytics 一致的近7天 Codex/Work Credits 汇总；用标准 OpenAI OAuth 登录即可，无需 API key。凭证直接读 OpenCode V2 的凭证存储，插件不会自己去刷 OpenAI 的一次性 refresh token（由 opencode 负责续期）
@@ -100,7 +100,8 @@ npx tsc   # 可选，类型检查/构建
 opencode service restart
 ```
 
-再重新运行 `opencode`，右侧侧边栏就会出现 **Usage → Session Cache → Providers**。
+再重新运行 `opencode`，右侧侧边栏就会出现三个区块（每个都是"可点击折叠的标题行 + 圆角方框内容"）：
+**💾 会话缓存 → 📋 会话 → 🌐 提供商**。
 
 ### 工作空间 / Go 套餐
 
@@ -217,6 +218,7 @@ POST https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/GetStepPl
 | `usageThresholdPercent` | `number` | `80` | Toast 警告触发的用量百分比 |
 | `sessionsPanel` | `boolean` | `true` | 侧边栏是否显示「会话」状态面板（也可以点标题随时折叠） |
 | `sessionToasts` | `boolean` | `true` | 其它会话完成任务 / 需要授权 / 需要选择时是否弹 Toast |
+| `sessionsIdleMinutes` | `number` | `120` | 空闲会话在面板里保留多久（分钟）；`0` 表示只显示活跃/待确认的会话 |
 | `language`（tui 插件） | `string` | `en` | 侧边栏语言：`en` 或 `zh` |
 
 ## 收集的数据
