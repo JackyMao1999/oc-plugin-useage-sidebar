@@ -568,6 +568,7 @@ interface Strings {
   statusNeedsInput: string
   sessionUntitled: string
   sessionsMore: (n: number) => string
+  sessionOpenFailed: string
   sessionsOffline: string
   toastDone: string
   toastPermission: string
@@ -642,6 +643,7 @@ function makeStrings(lang: Lang): Strings {
         statusNeedsInput: "待确认",
         sessionUntitled: "未命名会话",
         sessionsMore: (n: number) => `还有 ${n} 个会话`,
+        sessionOpenFailed: "无法打开会话",
         sessionsOffline: "仅本窗口会话",
         toastDone: "任务完成",
         toastPermission: "需要授权确认",
@@ -714,6 +716,7 @@ function makeStrings(lang: Lang): Strings {
         statusNeedsInput: "Needs input",
         sessionUntitled: "Untitled session",
         sessionsMore: (n: number) => `${n} more session${n > 1 ? "s" : ""}`,
+        sessionOpenFailed: "Unable to open session",
         sessionsOffline: "This window only",
         toastDone: "Task finished",
         toastPermission: "Permission needed",
@@ -1437,7 +1440,16 @@ return (
         </Show>
         <For each={visibleSessionRows()}>
           {(row) => (
-            <box flexDirection="row" gap={1}>
+            <box
+              flexDirection="row"
+              gap={1}
+              onMouseDown={() => {
+                if (row.current) return
+                if (!props.api.ui.openSession?.(row.id)) {
+                  props.api.ui.toast({ variant: "error", message: t.sessionOpenFailed })
+                }
+              }}
+            >
               {/* 状态看行首符号 + 颜色：? 待确认（warning） / ↻ 重试中（warning）
                   ● 运行中（accent） / ○ 空闲（muted）；行尾不再挂文字，避免被裁掉 */}
               <text fg={row.color}>{row.glyph}</text>
@@ -2015,6 +2027,18 @@ function createTuiApi(context: any) {
     attention: context.attention,
     ui: {
       toast: (input: any) => context.ui.toast.show(input),
+      openSession: (sessionID: string): boolean => {
+        if (!sessionID) return false
+        try {
+          // Prefer native tabs: focus an existing tab or open it when needed.
+          // If tabs are disabled, fall back to the session router.
+          if (context.ui.tabs.focus(sessionID)) return true
+          context.ui.router.navigate({ type: "session", sessionID })
+          return true
+        } catch {
+          return false
+        }
+      },
     },
   }
 
