@@ -564,7 +564,6 @@ interface Strings {
   stepfunCookieNotSet: string
   sessions: string
   noSessions: string
-  statusBusy: string
   statusRetry: string
   statusNeedsInput: string
   sessionUntitled: string
@@ -639,7 +638,6 @@ function makeStrings(lang: Lang): Strings {
         stepfunCookieNotSet: "未配置 Cookie，无法读取套餐用量（见 README）",
         sessions: "会话",
         noSessions: "没有运行中的会话",
-        statusBusy: "运行中",
         statusRetry: "重试中",
         statusNeedsInput: "待确认",
         sessionUntitled: "未命名会话",
@@ -712,7 +710,6 @@ function makeStrings(lang: Lang): Strings {
         stepfunCookieNotSet: "Cookie not set, plan usage unavailable (see README)",
         sessions: "Sessions",
         noSessions: "No sessions running",
-        statusBusy: "Working",
         statusRetry: "Retrying",
         statusNeedsInput: "Needs input",
         sessionUntitled: "Untitled session",
@@ -987,18 +984,6 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
   const SESSION_ROW_LIMIT = 10
   const visibleSessionRows = createMemo(() => sessionRows().slice(0, SESSION_ROW_LIMIT))
   const hiddenSessionCount = createMemo(() => Math.max(0, sessionRows().length - SESSION_ROW_LIMIT))
-
-  // 符号图例：只解释"需要留意"的状态（? 待确认 / ↻ 重试中 / ● 运行中），
-  // 空闲（○）是默认状态且整行是灰的，不列出来——否则用户会把图例当成一条会话。
-  // 最多两条，避免侧边栏太窄被裁掉。
-  const sessionLegend = createMemo(() => {
-    const rows = sessionRows()
-    const parts: string[] = []
-    if (rows.some((row) => row.rank === 3)) parts.push(`? ${t.statusNeedsInput}`)
-    if (rows.some((row) => row.glyph === "↻")) parts.push(`↻ ${t.statusRetry}`)
-    if (rows.some((row) => row.glyph === "●")) parts.push(`● ${t.statusBusy}`)
-    return parts.slice(0, 2).join(" · ")
-  })
 
   // goUsage : 服务端插件写入的官方 /zen/go/v1/usage 快照，没有才回退到本地累计的 goWindows
   const goUsage = createMemo(() => providers()["opencode-go"]?.goApi ?? null)
@@ -1464,10 +1449,6 @@ return (
         </For>
         <Show when={hiddenSessionCount() > 0}>
           <text fg={theme().textMuted}>{t.sessionsMore(hiddenSessionCount())}</text>
-        </Show>
-        {/* 图例：加括号 + 灰色，明确它不是一条会话 */}
-        <Show when={sessionLegend()}>
-          <text fg={theme().textMuted}>({sessionLegend()})</text>
         </Show>
         </box>
         </Show>
