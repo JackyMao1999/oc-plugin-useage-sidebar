@@ -465,6 +465,27 @@ const DISPLAY_NAMES: Record<string, string> = {
 // 可用插件选项 sessionsIdleMinutes 调整（0 = 只看活跃与待确认的会话）
 const SESSION_IDLE_WINDOW_MS = 120 * 60 * 1000
 
+// 运行中会话的"呼吸"动画帧：●（满）→ ◉ → ◎ → ○（空）→ ◎ → ◉，循环一次约 1.5 秒。
+// 终端里没有透明度动画，用圆点的"胖瘦"模拟呼吸；颜色保持强调色，不会和灰色的空闲 ○ 混叠。
+const BREATH_FRAMES = ["●", "◉", "◎", "○", "◎", "◉"]
+const BREATH_FRAME_MS = 250
+
+// 会话 time 字段的"本地 + 服务端"合并。
+// 服务端快照（session.list 轮询）和本地缓存（data.session.list）都会带一份 time，
+// 直接用本地覆盖会把服务端刚更新的 idle / viewed 抹掉（本地副本可能更旧、或缺字段），
+// 导致"已完成未读"的 ✓ 刚刚消失又闪回来。这些字段都是只增的时间戳，取较大值最稳妥。
+function mergeSessionTime(remote: any, local: any): Record<string, number> {
+  const merged: Record<string, number> = { ...(remote ?? {}), ...(local ?? {}) }
+  for (const key of ["created", "updated", "idle", "viewed"] as const) {
+    const remoteAt = Number(remote?.[key])
+    const localAt = Number(local?.[key])
+    if (Number.isFinite(remoteAt) && Number.isFinite(localAt)) {
+      merged[key] = Math.max(remoteAt, localAt)
+    }
+  }
+  return merged
+}
+
 const STEPFUN_PROVIDER_IDS = new Set(["stepfun", "step", "stepfun-step-plan"])
 function isStepFunProvider(providerID: string): boolean {
   return STEPFUN_PROVIDER_IDS.has(providerID)
@@ -870,6 +891,14 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
   //   这很重要！如果不清理，定时器会永远运行，造成内存泄漏
   onCleanup(() => clearInterval(timer))
 
+  // -------- 运行中会话的"呼吸"动画 --------
+  // breathFrame 每 250ms 前进一步，运行中（busy）会话的行首符号按 BREATH_FRAMES
+  // 循环：●→◉→◎→○→◎→◉，约 1.5 秒一次"吸气-呼气"。
+  // 没有会话在跑时这个信号没有任何观察者，不触发重绘，开销为零。
+  const [breathFrame, setBreathFrame] = createSignal(0)
+  const breathTimer = setInterval(() => setBreathFrame((frame) => frame + 1), BREATH_FRAME_MS)
+  onCleanup(() => clearInterval(breathTimer))
+
   // -------- 计算属性（createMemo） --------
   // createMemo: 创建一个"记忆化的计算值"
   //   它只依赖 data()，只有 data() 变化时才会重新计算
@@ -929,9 +958,20 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
   //   状态全部靠"行首符号 + 颜色"表达（侧边栏很窄，行尾再挂状态文字会被裁掉）：
   //     ? 待确认（授权/表单，warning 色，标题同为 warning）
   //     ↻ 重试中（warning）
-  //     ● 运行中（accent）
+  //     ● 运行中（accent，符号带呼吸动画，见 BREATH_FRAMES）
+  //     ✓ 已完成但还没打开看过（success 色 —— 用户点开该会话后符号变回 ○）
   //     ○ 空闲（muted，标题也淡掉）
-  //   排序：待确认 > 运行中/重试 > 空闲，同组内按最近更新时间
+  //   排序：待确认 > 已完成未读 > 运行中/重试 > 空闲，同组内按最近更新时间
+  //
+  //   "已完成未读"的判定：服务端会话信息里 time.idle 是最后一次跑完的时间点，
+  //   time.viewed 是用户打开/查看该会话的时间（V2 主界面聚焦会话时会自动调
+  //   session.view 把它追平）。idle 比 viewed 新 = 这轮完成还没被看过，挂 ✓ 提醒；
+  //   用户打开会话后 viewed 追上 idle，✓ 让位给 ○。
+  //   locallyViewed 是本地乐观更新：点开的那一下就先把 ✓ 收掉，不等服务端同步。
+  const locallyViewed = new Map<string, number>()
+  const markViewed = (sessionID: string) => {
+    locallyViewed.set(sessionID, Date.now())
+  }
   const sessionRows = createMemo(() => {
     if (props.showSessions === false) return []
     props.api.state.revision?.()
@@ -940,6 +980,7 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
     // 本窗口打开的标签页会话：空闲也要列（它们确实开着）
     const tabIDs = (props.api.state.tabSessionIDs?.() ?? []) as string[]
     const idleWindowMs = props.sessionsIdleMs ?? SESSION_IDLE_WINDOW_MS
+    const now = Date.now()
     const rows: Array<{
       id: string
       title: string
@@ -947,6 +988,7 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
       color: string
       titleColor: string
       current: boolean
+      busy: boolean
       rank: number
       updated: number
     }> = []
@@ -957,25 +999,36 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
       const busy = status === "running"
       const retry = status === "retry"
       const child = Boolean(info.parentID)
-      // 子会话只在真正干活/等人时才列出，避免刷屏
-      if (child && !needsInput && !busy && !retry) continue
+      // 已完成未读：这轮结果还没被看过（含子会话 —— "子任务跑完了"正是要提醒的）
+      const viewedAt = Math.max(Number(info.time?.viewed) || 0, locallyViewed.get(info.id) ?? 0)
+      const idleAt = Number(info.time?.idle) || 0
+      const done = idleAt > viewedAt
+      if (done) locallyViewed.delete(info.id)
+      // 清理过期的本地记录（窗口外的会话完成事件不会到这里，按保留窗口淘汰即可）
+      else if (locallyViewed.has(info.id) && now - (locallyViewed.get(info.id) ?? 0) > idleWindowMs) {
+        locallyViewed.delete(info.id)
+      }
+      // 子会话只在真正干活/等人/刚跑完没看时才列出，避免刷屏
+      if (child && !needsInput && !busy && !retry && !done) continue
       // "最近活动"取 updated 和 viewed 的较新值：会话可能只是被打开看过、还没有新消息
       const updated = Math.max(Number(info.time?.updated) || 0, Number(info.time?.viewed) || 0)
       const idle = !needsInput && !busy && !retry
       // 空闲会话保留：最近活跃/查看过的、当前正在看的、以及本窗口打开的标签页
+      // （已完成未读的也算"活跃"—— 它正等着被点开）
       const openedHere = tabIDs.includes(info.id)
-      if (idle && !openedHere && info.id !== currentID && Date.now() - updated > idleWindowMs) continue
+      if (idle && !done && !openedHere && info.id !== currentID && now - updated > idleWindowMs) continue
       const title = String(info.title ?? "").trim() || t.sessionUntitled
       const isCurrent = info.id === currentID
       rows.push({
         id: info.id,
         title: child ? `└ ${title}` : title,
-        glyph: needsInput ? "?" : retry ? "↻" : busy ? "●" : "○",
-        color: needsInput || retry ? theme().warning : busy ? theme().accent : theme().textMuted,
+        glyph: needsInput ? "?" : retry ? "↻" : busy ? "●" : done ? "✓" : "○",
+        color: needsInput || retry ? theme().warning : busy ? theme().accent : done ? theme().success : theme().textMuted,
         // 待确认最显眼（warning），正在看的会话用强调色，空闲的整行淡掉
         titleColor: needsInput ? theme().warning : isCurrent ? theme().accent : idle ? theme().textMuted : theme().text,
         current: isCurrent,
-        rank: needsInput ? 3 : busy || retry ? 2 : 1,
+        busy,
+        rank: needsInput ? 4 : done ? 3 : busy || retry ? 2 : 1,
         updated,
       })
     }
@@ -1445,14 +1498,18 @@ return (
               gap={1}
               onMouseDown={() => {
                 if (row.current) return
+                // 点开的那一下就把"已完成"符号收掉：打开后服务端会把 time.viewed
+                // 追平，符号自然变成 ○；先用本地记录顶一下，不用等轮询
+                markViewed(row.id)
                 if (!props.api.ui.openSession?.(row.id)) {
                   props.api.ui.toast({ variant: "error", message: t.sessionOpenFailed })
                 }
               }}
             >
               {/* 状态看行首符号 + 颜色：? 待确认（warning） / ↻ 重试中（warning）
-                  ● 运行中（accent） / ○ 空闲（muted）；行尾不再挂文字，避免被裁掉 */}
-              <text fg={row.color}>{row.glyph}</text>
+                  ● 运行中（accent，按帧呼吸） / ✓ 已完成未读（success，打开后变 ○）
+                  / ○ 空闲（muted）；行尾不再挂文字，避免被裁掉 */}
+              <text fg={row.color}>{row.busy ? BREATH_FRAMES[breathFrame() % BREATH_FRAMES.length] : row.glyph}</text>
               <text fg={row.titleColor}>
                 {row.current ? "› " : "  "}{truncate(row.title, 18)}
               </text>
@@ -1979,7 +2036,7 @@ function createTuiApi(context: any) {
           for (const info of context.data.session.list() ?? []) {
             if (!info?.id) continue
             const existing = merged.get(info.id)
-            merged.set(info.id, existing ? { ...existing, ...info, time: { ...existing.time, ...info.time } } : info)
+            merged.set(info.id, existing ? { ...existing, ...info, time: mergeSessionTime(existing.time, info.time) } : info)
           }
         } catch {
           // 本地缓存不可用时只用服务端快照
