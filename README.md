@@ -7,6 +7,7 @@ AI model usage monitoring plugin for [opencode](https://opencode.ai). Tracks ses
 ## Features
 
 - **Follows the active model** — the sidebar shows exactly one provider: the one in use. Picking a model in `/models` switches it immediately: OpenCode only persists the choice on the next prompt, so the plugin follows `~/.local/state/opencode/model.json` to switch right away
+- **All-sessions token total** — the Session Cache panel ends with one more line: the summed token count OpenCode itself computes across every session (`SessionInfo.tokens`: input + output + reasoning + cache read/write, the same numbers as the built-in `/stats`), including sessions from other windows and directories; the `(N)` suffix is how many sessions were summed. Straight from OpenCode's data layer, not the plugin's own accounting
 - **Session cache hit rate** — live `cache read / (input + read)` for the current session (Hit rate, Input, Read, Write)
 - **Response speed** — tracks time to first token (TTFT) and output throughput (Tokens/s); the sidebar shows current-session averages, while `usage_stats` shows persisted totals
 - **Resettable token counter** — the sidebar's token count is accumulated by the plugin; press `Ctrl+Y` (or run "Reset token usage" from the command palette) to zero the current provider's count, after which it accumulates again from zero

@@ -597,6 +597,7 @@ type Lang = "en" | "zh"
 
 interface Strings {
   usage: string
+  allSessions: string
   sessionCache: string
   hitRate: string
   input: string
@@ -672,6 +673,7 @@ function makeStrings(lang: Lang): Strings {
   return lang === "zh"
     ? {
         usage: "用量",
+        allSessions: "全部会话",
         sessionCache: "会话缓存",
         hitRate: "命中率",
         input: "输入",
@@ -745,6 +747,7 @@ function makeStrings(lang: Lang): Strings {
       }
     : {
         usage: "Usage",
+        allSessions: "All sessions",
         sessionCache: "Session Cache",
         hitRate: "Hit rate",
         input: "Input",
@@ -890,7 +893,7 @@ function legacyTheme(theme: any) {
  *   - api.client        : opencode 的 SDK 客户端（可以调用 API）
  *
  * 组件渲染的 UI 结构（从上到下，每个区块都是"可点击的标题行 + 圆角方框内容"）：
- *   ▼ Session Cache ← 当前会话的缓存命中率
+ *   ▼ Session Cache ← 当前会话的缓存命中率 + 全部会话 Token 合计
  *   ▼ Sessions      ← 所有窗口/目录的会话及状态
  *   ▼ Providers     ← OpenAI/Anthropic/Go/Zen 的费用和进度条
  */
@@ -1282,6 +1285,28 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
     return stats
   })
 
+  // allSessionsStats : 全部会话的 Token 合计（OpenCode 自己统计的数据）
+  //   直接累加服务端已累计好的 SessionInfo.tokens（input/output/reasoning/
+  //   缓存读取/缓存写入），与内置 /stats 同源，不经过插件 JSON 数据文件；
+  //   含别的窗口/目录的会话（服务端会话列表），在会话缓存面板末尾显示一行。
+  const allSessionsStats = createMemo(() => {
+    props.api.state.revision?.()
+    const totals = { input: 0, output: 0, reasoning: 0, read: 0, write: 0, total: 0, count: 0 }
+    const list = (props.api.state.sessions?.() ?? []) as any[]
+    for (const info of list) {
+      const tk = info?.tokens
+      if (!info?.id || tk == null) continue
+      totals.count++
+      totals.input += Number(tk.input) || 0
+      totals.output += Number(tk.output) || 0
+      totals.reasoning += Number(tk.reasoning) || 0
+      totals.read += Number(tk.cache?.read) || 0
+      totals.write += Number(tk.cache?.write) || 0
+    }
+    totals.total = totals.input + totals.output + totals.reasoning + totals.read + totals.write
+    return totals
+  })
+
   // -------- UI 辅助函数 --------
   // 这些小函数返回 JSX 元素（HTML 标签），用来避免重复写相同的代码
 
@@ -1604,6 +1629,15 @@ return (
               fmtTokensPerSecond(responseStats().outputTokens / (responseStats().generationMs / 1000)),
             )}
           </Show>
+        </Show>
+        {/* 全部会话：OpenCode 自己统计的各会话 tokens（输入+输出+推理+缓存读/写）合计，
+            含别的窗口/目录的会话，括号里是参与累加的会话数 */}
+        <Show when={allSessionsStats().count > 1 && allSessionsStats().total > 0}>
+          <box flexDirection="row" gap={1}>
+            <text fg={theme().textMuted}>{padLabel(t.allSessions)}</text>
+            <text fg={theme().text}>{fmtTokens(allSessionsStats().total)}</text>
+            <text fg={theme().textMuted}>({allSessionsStats().count})</text>
+          </box>
         </Show>
         {/* 上面的命中率经 BarRow 用 fmtPct 格式化：整数不带 .0 */}
         <Show when={cacheStats().turns === 0}>

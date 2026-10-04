@@ -7,6 +7,7 @@
 ## 功能
 
 - **跟随当前模型** — 侧边栏只显示当前使用中的那一个提供商；在 `/models` 里一选新模型就立刻切换（opencode 要等下一次发消息才把选择落库，插件通过 `~/.local/state/opencode/model.json` 提前跟随）
+- **全部会话 Token 合计** — 会话缓存面板末尾多一行 OpenCode 自己统计的各会话 Token 总计（`SessionInfo.tokens` 的 输入+输出+推理+缓存读/写 之和，与内置 `/stats` 同源），含别的窗口/目录的会话，括号 `(N)` 为参与累加的会话数；直接取自 OpenCode 数据层，不是插件自累计的数字
 - **会话缓存命中率** — 实时统计当前会话的 `cache read / (input + read)`，显示 Hit rate、Input、Read、Write
 - **响应速度** — 统计首字延迟（TTFT）和输出速度（Tokens/s）；侧边栏显示当前会话平均值，`usage_stats` 显示持久化累计值
 - **Token 计数可清零** — 侧边栏的 `Token数` 是插件累计值，按 `Ctrl+Y`（或命令面板搜 "Reset token usage"）即可把当前提供商的计数归零，之后的用量重新累计
