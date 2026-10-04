@@ -95,8 +95,16 @@ interface ProviderUsage {
   limit?: number | null;
   remaining?: number;
   totalTokens?: number;
+  // 累计缓存 token（读取/写入）。与 OpenCode 会话统计同源：session.usage.updated
+  // 的 tokens 本来带 cache.read/write，此前只累计 input+output+reasoning，
+  // 导致长会话里"提供商 Token数"远小于会话面板的用量（缓存占 90%+）。
+  // 单独两个字段、不与 totalTokens 合并：缓存读取按折扣价计费且每步重复累加，
+  // 混进同一个数字会失去信息量。
+  totalCacheRead?: number;
+  totalCacheWrite?: number;
   // TUI 侧按快捷键清零 Token 时写入的时间戳（毫秒）。服务端读到更新的标记后
   // 会把内存里的累计值一起清零，避免"数字取较大值"的合并逻辑把旧值写回来。
+  // 清零语义覆盖缓存两项：提供商的三行数字一起回到 0，保持与会话面板可比。
   tokensResetAt?: number;
   lastChecked?: string;
   dailyCosts?: Record<string, number>;
@@ -642,9 +650,10 @@ export function mergeUsageData(disk: UsageData | null, ours: UsageData): UsageDa
 // ============================================================================
 // Token 清零（TUI 侧按快捷键写入标记，服务端在这里落实）
 // ----------------------------------------------------------------------------
-// 侧边栏的 "Token数" 是插件自己累计出来的（不是服务端给的累计值），所以清零要
-// 两边配合：TUI 把文件里的 totalTokens 写 0 并打上 tokensResetAt 时间戳，服务端
-// 读到比记录更新的标记后，把内存里的累计值也一起清零。
+// 侧边栏的 "Token数"（连同"缓存读取/写入"两行）是插件自己累计出来的（不是服务端
+// 给的累计值），所以清零要两边配合：TUI 把文件里的 totalTokens 和 totalCacheRead/
+// Write 写 0 并打上 tokensResetAt 时间戳，服务端读到比记录更新的标记后，
+// 把内存里的累计值也一起清零。
 // ============================================================================
 
 // 每个 provider 已经应用过的清零标记，避免插件重启后又清一次（磁盘上的
@@ -659,7 +668,7 @@ function tokenResetStamp(pu: unknown): number {
 /**
  * 把磁盘上的清零标记落实到内存数据上。
  * - adopt = true：只登记当前标记（插件启动时调用，表示"这些标记我已经是清零后的状态"）
- * - adopt = false：标记比记录更新时，把该 provider 的 totalTokens 归零
+ * - adopt = false：标记比记录更新时，把该 provider 的 totalTokens 与缓存两项归零
  * 返回是否真的清零了（调用方据此 markDirty 落盘）。
  */
 export function applyTokenResets(disk: UsageData | null, data: UsageData, adopt: boolean): boolean {
@@ -674,7 +683,10 @@ export function applyTokenResets(disk: UsageData | null, data: UsageData, adopt:
     if (adopt) continue;
     const pu = data.providerUsage[providerID];
     if (!pu) continue;
+    // 三行数字一起清零（Token数 + 缓存读/写），与会话面板保持一致的可比性
     pu.totalTokens = 0;
+    pu.totalCacheRead = 0;
+    pu.totalCacheWrite = 0;
     // 标记也要跟着合并（数字取较大值），否则旧实例先落盘时会把标记抹掉
     pu.tokensResetAt = stamp;
     changed = true;
@@ -880,6 +892,8 @@ function formatProviderUsage(pu: ProviderUsage, label: string): string {
   } else {
     if (pu.cost != null) lines.push(`  Cost:       $${pu.cost.toFixed(2)}`);
     if (pu.totalTokens != null) lines.push(`  Tokens:     ${formatTokens(pu.totalTokens)}`);
+    if (pu.totalCacheRead != null) lines.push(`  Cache read: ${formatTokens(pu.totalCacheRead)}`);
+    if (pu.totalCacheWrite != null) lines.push(`  Cache write:${formatTokens(pu.totalCacheWrite)}`);
     if (pu.limit != null) lines.push(`  Limit:      $${pu.limit}`);
     if (pu.remaining != null) lines.push(`  Remaining:  $${pu.remaining.toFixed(2)}`);
     if (pu.limit != null && pu.cost != null && pu.limit > 0) {
@@ -1294,6 +1308,9 @@ const UsagePlugin = Plugin.define({
   const sessionModels = new Map<string, string>();
   const sessionCosts = new Map<string, number>();
   const sessionTokens = new Map<string, number>();
+  // 每会话最近一次已计的缓存读/写累计值：与 sessionTokens 同一套"单调递增取增量"
+  // 机制，读/写各自独立记账（缓存写入价为读取的 10 倍，混在一起会失真）
+  const sessionCacheTokens = new Map<string, { read: number; write: number }>();
 
   const finiteTimestamp = (value: unknown): number | undefined => {
     const n = Number(value);
@@ -1427,6 +1444,19 @@ const UsagePlugin = Plugin.define({
     data.providerUsage[providerID] = pu;
   };
 
+  // 按 provider 累计一个 token 计数字段（非零增量才落账：避免给不支持缓存的
+  // provider 凭空多出一行 "缓存写入 0"，也让展示层能用 != null 判断"有没有数据"）
+  const addProviderTokenCounter = (
+    providerID: string,
+    field: "totalTokens" | "totalCacheRead" | "totalCacheWrite",
+    delta: number,
+  ) => {
+    if (!Number.isFinite(delta) || delta <= 0) return;
+    const pu = data.providerUsage[providerID] || { lastChecked: new Date().toISOString() };
+    pu[field] = (pu[field] || 0) + delta;
+    data.providerUsage[providerID] = pu;
+  };
+
   const updateSessionUsage = (event: any) => {
     const usage = event?.data;
     const sessionID = typeof usage?.sessionID === "string" ? usage.sessionID : undefined;
@@ -1453,9 +1483,27 @@ const UsagePlugin = Plugin.define({
       const previousTokens = sessionTokens.get(sessionID) || 0;
       if (currentTokens >= previousTokens) {
         sessionTokens.set(sessionID, currentTokens);
-        const pu = data.providerUsage[providerID] || { lastChecked: new Date().toISOString() };
-        pu.totalTokens = (pu.totalTokens || 0) + currentTokens - previousTokens;
-        data.providerUsage[providerID] = pu;
+        addProviderTokenCounter(providerID, "totalTokens", currentTokens - previousTokens);
+      }
+
+      // 缓存读/写单独累计。它们与 OpenCode 会话面板、内置 /stats 同源
+      // （session.usage.updated 的 tokens.cache），长会话里缓存读取占 token 总量
+      // 的 90%+，不计入会让"提供商 Token数"看起来永远比会话用量小。
+      const cache = tokens.cache && typeof tokens.cache === "object" ? tokens.cache : undefined;
+      if (cache) {
+        const previousCache = sessionCacheTokens.get(sessionID) || { read: 0, write: 0 };
+        const currentCache = { ...previousCache };
+        const read = Number(cache.read);
+        const write = Number(cache.write);
+        if (Number.isFinite(read) && read >= previousCache.read) {
+          addProviderTokenCounter(providerID, "totalCacheRead", read - previousCache.read);
+          currentCache.read = read;
+        }
+        if (Number.isFinite(write) && write >= previousCache.write) {
+          addProviderTokenCounter(providerID, "totalCacheWrite", write - previousCache.write);
+          currentCache.write = write;
+        }
+        sessionCacheTokens.set(sessionID, currentCache);
       }
     }
     markDirty();

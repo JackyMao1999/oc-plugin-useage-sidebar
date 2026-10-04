@@ -321,7 +321,9 @@ interface ProviderUsage {
   cost?: number                                           // 总费用
   limit?: number | null                                    // 限额（null 表示无限额）
   remaining?: number                                       // 剩余额度
-  totalTokens?: number                                     // 总 token 数
+  totalTokens?: number                                     // 总 token 数（input+output+reasoning）
+  totalCacheRead?: number                                  // 累计缓存读取 token（与会话面板同口径）
+  totalCacheWrite?: number                                 // 累计缓存写入 token
   lastChecked?: string                                     // 最后一次查询时间（ISO 格式）
   dailyCosts?: Record<string, number>                      // 按天汇总的费用 { "2026-07-18": 8.5, "2026-07-17": 6.2 }
   recentEvents?: Array<{ time: number; cost: number }>    // 最近的事件列表（用于计算 rolling 5h）
@@ -560,10 +562,11 @@ function providerUsageFor(providerUsage: Record<string, ProviderUsage>, provider
 }
 
 /**
- * 把某个 provider 的累计 Token 数清零（侧边栏上显示的 "Token数"）。
+ * 把某个 provider 的累计 Token 数清零（侧边栏上显示的 "Token数"，连同
+ * "缓存读取/写入" 两行一起清）。
  *
  * 只写文件不够：累计值是服务端插件（index.ts）自己算出来的，而它写盘时会做
- * "数字取较大值"的合并，会把刚清零的数字又恢复成旧值。所以除了 totalTokens = 0，
+ * "数字取较大值"的合并，会把刚清零的数字又恢复成旧值。所以除了三个计数写 0，
  * 还要打一个 tokensResetAt 时间戳，服务端读到更新的标记时会把内存里的累计值
  * 一起清零（见 index.ts 的 applyTokenResets）。
  */
@@ -577,7 +580,13 @@ function resetProviderTokens(providerID: string): boolean {
       ? [providerID, "stepfun", "step", "stepfun-step-plan"]
       : [providerID]
     const key = candidates.find((candidate) => usage[candidate]) ?? providerID
-    usage[key] = { ...(usage[key] ?? {}), totalTokens: 0, tokensResetAt: Date.now() }
+    usage[key] = {
+      ...(usage[key] ?? {}),
+      totalTokens: 0,
+      totalCacheRead: 0,
+      totalCacheWrite: 0,
+      tokensResetAt: Date.now(),
+    }
     const tmpFile = `${DATA_FILE}.${process.pid}.tmp`
     writeFileSync(tmpFile, JSON.stringify(file, null, 2))
     renameSync(tmpFile, DATA_FILE)
@@ -604,6 +613,8 @@ interface Strings {
   output: string
   read: string
   write: string
+  cacheRead: string
+  cacheWrite: string
   ttft: string
   tokensPerSecond: string
   noTurns: string
@@ -680,6 +691,8 @@ function makeStrings(lang: Lang): Strings {
         output: "输出",
         read: "缓存读取",
         write: "缓存写入",
+        cacheRead: "缓存读取",
+        cacheWrite: "缓存写入",
         ttft: "首字延迟",
         tokensPerSecond: "输出速度",
         noTurns: "暂无助手回复",
@@ -754,6 +767,8 @@ function makeStrings(lang: Lang): Strings {
         output: "Output",
         read: "Read",
         write: "Write",
+        cacheRead: "Cache read",
+        cacheWrite: "Cache write",
         ttft: "TTFT",
         tokensPerSecond: "Tokens/s",
         noTurns: "No assistant turns yet",
@@ -1583,12 +1598,21 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
       </Show>
 
       <Show when={pu?.totalTokens != null}>
-        {/* Token 数可以按快捷键清零，右侧给出提示 */}
+        {/* Token 数可以按快捷键清零，右侧给出提示；清零同时清掉下面两行缓存 */}
         <box flexDirection="row" gap={1}>
           <text fg={theme().textMuted}>{padLabel(t.tokens)}</text>
           <text fg={theme().text}>{fmtTokens(pu!.totalTokens!)}</text>
           <text fg={theme().textMuted}>· {t.resetTokensHint}</text>
         </box>
+      </Show>
+
+      {/* 缓存读/写：与"会话缓存"面板同口径（服务端 session.usage.updated 的
+          tokens.cache），此前不统计导致长会话里提供商数远小于会话用量 */}
+      <Show when={pu?.totalCacheRead != null}>
+        {InfoRow(t.cacheRead, fmtTokens(pu!.totalCacheRead!))}
+      </Show>
+      <Show when={pu?.totalCacheWrite != null}>
+        {InfoRow(t.cacheWrite, fmtTokens(pu!.totalCacheWrite!))}
       </Show>
 
     </box>

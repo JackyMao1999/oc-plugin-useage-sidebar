@@ -10,7 +10,7 @@ AI model usage monitoring plugin for [opencode](https://opencode.ai). Tracks ses
 - **All-sessions token total** — the Session Cache panel ends with one more line: the summed token count OpenCode itself computes across every session (`SessionInfo.tokens`: input + output + reasoning + cache read/write, the same numbers as the built-in `/stats`), including sessions from other windows and directories; the `(N)` suffix is how many sessions were summed. Straight from OpenCode's data layer, not the plugin's own accounting
 - **Session cache hit rate** — live `cache read / (input + read)` for the current session (Hit rate, Input, Read, Write)
 - **Response speed** — tracks time to first token (TTFT) and output throughput (Tokens/s); the sidebar shows current-session averages, while `usage_stats` shows persisted totals
-- **Resettable token counter** — the sidebar's token count is accumulated by the plugin; press `Ctrl+Y` (or run "Reset token usage" from the command palette) to zero the current provider's count, after which it accumulates again from zero
+- **Provider token counters (cache-aware, resettable)** — under "Providers" the sidebar shows three plugin-accumulated counters: `Tokens` (input + output + reasoning), `Cache read`, and `Cache write`, tracked from the same `session.usage.updated` events OpenCode uses for per-session totals. Earlier only non-cache tokens were counted, while long sessions spend 90%+ of their tokens on cache reads — so the provider number always looked far smaller than the session panel. Cache is kept on its own rows because cache reads recur on every step at discounted pricing; merging them into one number would make it meaningless. Press `Ctrl+Y` (or run "Reset token usage" from the command palette) to zero all three counters of the current provider, after which they accumulate again from zero
 - **Session status panel (cross-window)** — a framed list of every session, with the state carried entirely by a leading symbol plus colour (the sidebar is narrow, so trailing status text gets clipped): `?` needs input (permission/form, yellow warning, title tinted too), `↻` retrying (yellow), `●` working (accent, the dot pulses in a breathing animation), `✓` finished but not opened yet (success green — it flips back to `○` as soon as you open the session), `○` idle (grey, whole row dimmed); the current session is marked with `›`. Finished-but-unread rows sort just below needs-input ones. Subagent (child) sessions are listed in a tree directly under their parent — a group ranks by its most urgent member. Reading is tracked server-side: clicking a row calls `session.view` for exactly that session (a child session's own screen never opens — the UI shows the parent — so without this the child's `✓` would never clear), and opening a parent also counts as having read its finished children, so `✓` flips to `○` in every window instead of sticking. While a session runs a tool, a dim sub-line appears under its row showing what it's doing (`$ command`, `≡ read`, `✎ edit`, `✚ write`, `⌕ search`, `⚙ other`, `+N` when several calls run in parallel), fed by the global `session.tool.*` event stream — it works across windows and directories (a window opened mid-run catches up at the next tool event); turn it off with `sessionsToolActivity: false`. Idle sessions drop off after 2 hours by default (tabs open in this window, the current session, and active/needs-input/finished-unread sessions are exempt); tune it with `sessionsIdleMinutes` (`0` = only active and needs-input sessions). The list, running state, and pending-input counts all come from the background service that every window shares, so **a window opened later still sees sessions that started earlier, even in other directories**; it refreshes every 5s and immediately on related events. If the server list cannot be fetched, the box shows "This window only" in yellow to say the panel fell back to local data. Click the header to collapse, or turn the whole panel off with `sessionsPanel: false`
 - **Cross-session toasts** — when a session in another OpenCode window finishes a task, asks for permission, or needs a choice, the current window shows a toast (the toast title is the session name; events are broadcast by the shared service, so sessions in other directories notify too). The session you are already watching is not re-announced; disable with `sessionToasts: false`
 - **Go plan usage** — official API percent windows (rolling 5h / weekly / monthly) with reset countdown
@@ -198,10 +198,11 @@ pass the cookie as `stepfunCookie`.
 | Shortcut | Action |
 |----------|--------|
 | `Ctrl+O` | Set the usage alert threshold (also in the command palette: "Set usage alert threshold") |
-| `Ctrl+Y` | Reset the active provider's token count (also in the command palette: "Reset token usage") |
+| `Ctrl+Y` | Reset the active provider's token counters — `Tokens` plus `Cache read` / `Cache write` (also in the command palette: "Reset token usage") |
 
-The reset only affects the accumulated token counter shown in the sidebar (the same
-number as `Tokens` in `usage_stats`); costs, balances, and plan windows are untouched.
+The reset only affects the accumulated token counters shown in the sidebar (the same
+numbers as `Tokens` / `Cache read` / `Cache write` in `usage_stats`); costs, balances,
+and plan windows are untouched.
 The TUI writes a `tokensResetAt` marker that the server-side plugin applies, so the
 "keep the larger number" merge used for the shared data file can't restore the old value.
 
@@ -250,7 +251,7 @@ them in `~/.config/opencode/cli.json`:
 | `session.execution.failed` | error count |
 | `tool.execute.after` | tool call frequency (per tool name) |
 | `filesystem.changed` | file modification count |
-| `session.usage.updated` | cumulative cost and token usage |
+| `session.usage.updated` | cumulative cost, token usage, and cache read/write totals |
 
 Provider data (when configured): cost, token count, plan limit, remaining quota. Response speed is captured from the first streamed text part through assistant completion; throughput is calculated as output tokens divided by the time from first token to completion.
 
