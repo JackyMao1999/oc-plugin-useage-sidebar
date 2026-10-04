@@ -486,6 +486,66 @@ function mergeSessionTime(remote: any, local: any): Record<string, number> {
   return merged
 }
 
+// 会话行下面那行"正在干什么"的文案：按工具类型挑最能说明问题的一段参数展示。
+// 侧边栏很窄，一律压成单行；没收录的工具直接显示名字（⚙ 前缀）。
+// 前缀符号刻意和状态符号（● ✓ ○ ? ↻ › └）错开，避免混淆。
+function toolActivityLine(name: string, input: Record<string, unknown> | undefined, extra: number): string {
+  const clip = (value: unknown, fallback: string, limit = 22): string => {
+    const raw = typeof value === "string" ? value.trim() : String(value ?? "").trim()
+    const oneLine = raw.replace(/\s+/g, " ") || fallback
+    return oneLine.length > limit ? `${oneLine.slice(0, limit - 1)}…` : oneLine
+  }
+  const fileName = (value: unknown): string => {
+    const p = typeof value === "string" ? value : ""
+    const cut = p.split(/[\\/]/).pop() ?? ""
+    return cut || p
+  }
+  let out: string
+  // 工具名可能缺席（晚开的窗口只收到 session.tool.called，它只带 input）：
+  // 用参数键推断 —— command → 跑命令，filePath → 文件操作，pattern → 搜索
+  if (!name && input) {
+    if (typeof input.command === "string") return extra > 0 ? `$ ${clip(input.command, "…")} +${extra}` : `$ ${clip(input.command, "…")}`
+    if (typeof input.filePath === "string") return extra > 0 ? `≡ ${clip(fileName(input.filePath), "…")} +${extra}` : `≡ ${clip(fileName(input.filePath), "…")}`
+    if (typeof input.pattern === "string") return extra > 0 ? `⌕ ${clip(input.pattern, "…")} +${extra}` : `⌕ ${clip(input.pattern, "…")}`
+  }
+  switch (name) {
+    case "bash":
+    case "shell":
+      out = `$ ${clip(input?.command, "…")}`
+      break
+    case "read":
+      out = `≡ ${clip(fileName(input?.filePath), "…")}`
+      break
+    case "edit":
+      out = `✎ ${clip(fileName(input?.filePath), "…")}`
+      break
+    case "write":
+      out = `✚ ${clip(fileName(input?.filePath), "…")}`
+      break
+    case "glob":
+      out = `✱ ${clip(input?.pattern, "…")}`
+      break
+    case "grep":
+      out = `⌕ ${clip(input?.pattern, "…")}`
+      break
+    case "webfetch":
+      out = `⇄ ${clip(input?.url, "…", 28)}`
+      break
+    case "websearch":
+      out = `⇄ ${clip(input?.query, "…")}`
+      break
+    case "task":
+      out = `⚑ ${clip(input?.subagent_type ?? input?.description, "…")}`
+      break
+    case "apply_patch":
+      out = `✚ patch`
+      break
+    default:
+      out = `⚙ ${clip(name, "?")}`
+  }
+  return extra > 0 ? `${out} +${extra}` : out
+}
+
 const STEPFUN_PROVIDER_IDS = new Set(["stepfun", "step", "stepfun-step-plan"])
 function isStepFunProvider(providerID: string): boolean {
   return STEPFUN_PROVIDER_IDS.has(providerID)
@@ -834,7 +894,7 @@ function legacyTheme(theme: any) {
  *   ▼ Sessions      ← 所有窗口/目录的会话及状态
  *   ▼ Providers     ← OpenAI/Anthropic/Go/Zen 的费用和进度条
  */
-function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSessions?: boolean; sessionsIdleMs?: number }) {
+function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSessions?: boolean; sessionsIdleMs?: number; showToolActivity?: boolean }) {
   // t : 当前语言的界面文案（en 或 zh，由插件 options.language 控制）
   const t = makeStrings(props.lang ?? "en")
 
@@ -954,34 +1014,48 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
     ]
   })
 
-  // sessionRows : 所有会话的状态列表（会话面板的数据源）
+  // sessionRows : 所有会话的状态列表（会话面板的数据源，父子树状结构）
   //   状态全部靠"行首符号 + 颜色"表达（侧边栏很窄，行尾再挂状态文字会被裁掉）：
   //     ? 待确认（授权/表单，warning 色，标题同为 warning）
   //     ↻ 重试中（warning）
   //     ● 运行中（accent，符号带呼吸动画，见 BREATH_FRAMES）
   //     ✓ 已完成但还没打开看过（success 色 —— 用户点开该会话后符号变回 ○）
   //     ○ 空闲（muted，标题也淡掉）
-  //   排序：待确认 > 已完成未读 > 运行中/重试 > 空闲，同组内按最近更新时间
+  //   树状：子会话（subagent，标题带 └ 前缀）永远跟在父会话行的下面；
+  //   排序按"组"进行 —— 组内状态最高的成员决定组的先后
+  //   （待确认 > 已完成未读 > 运行中/重试 > 空闲），同组内再按最近更新时间。
+  //   子会话可见但父会话本已被空闲窗口过滤掉时，把父会话拉回来当上下文行。
   //
   //   "已完成未读"的判定：服务端会话信息里 time.idle 是最后一次跑完的时间点，
-  //   time.viewed 是用户打开/查看该会话的时间（V2 主界面聚焦会话时会自动调
-  //   session.view 把它追平）。idle 比 viewed 新 = 这轮完成还没被看过，挂 ✓ 提醒；
-  //   用户打开会话后 viewed 追上 idle，✓ 让位给 ○。
-  //   locallyViewed 是本地乐观更新：点开的那一下就先把 ✓ 收掉，不等服务端同步。
+  //   time.viewed 是用户打开/查看该会话的时间。idle 比 viewed 新 = 这轮完成
+  //   还没被看过，挂 ✓ 提醒；用户打开会话后 viewed 追上 idle，✓ 让位给 ○。
+  //   两个关键修正（子会话的 viewed 曾经永远追不平，✓ 卡死）：
+  //   1) 子会话只能在父会话界面里被查看，主界面只会对根会话调 session.view，
+  //      子会话自己的 time.viewed 永远是空。因此子会话的"已看时间"取
+  //      max(自己的 viewed, 父会话的 viewed)：打开过父会话 = 看过了子任务结果。
+  //   2) 侧边栏点行时插件自己对被点的会话补调服务端 session.view（见 ui.openSession），
+  //      让 viewed 在服务端写平并经 session.viewed 事件广播，所有窗口同步消掉 ✓，
+  //      而不是只靠本地临时记录"看起来"消掉。
+  //   locallyViewed 是本地乐观更新：点开的那一下就先把 ✓ 收掉，不等服务端同步；
+  //   用 signal（viewedTick）驱动，点下立即重算，不用等 5 秒轮询。
   const locallyViewed = new Map<string, number>()
+  const [viewedTick, setViewedTick] = createSignal(0)
   const markViewed = (sessionID: string) => {
     locallyViewed.set(sessionID, Date.now())
+    setViewedTick((tick) => tick + 1)
   }
   const sessionRows = createMemo(() => {
     if (props.showSessions === false) return []
     props.api.state.revision?.()
+    viewedTick()
     const list = (props.api.state.sessions?.() ?? []) as any[]
     const currentID = props.sessionId
     // 本窗口打开的标签页会话：空闲也要列（它们确实开着）
     const tabIDs = (props.api.state.tabSessionIDs?.() ?? []) as string[]
     const idleWindowMs = props.sessionsIdleMs ?? SESSION_IDLE_WINDOW_MS
+    const showActivity = props.showToolActivity !== false
     const now = Date.now()
-    const rows: Array<{
+    interface SessionRow {
       id: string
       title: string
       glyph: string
@@ -991,16 +1065,29 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
       busy: boolean
       rank: number
       updated: number
-    }> = []
+      // 正在进行的工具调用（"在干什么"子行）；开关关掉或没有活动时是 undefined
+      activity?: { name: string; input?: Record<string, unknown>; extra: number }
+    }
+    interface SessionNode {
+      row: SessionRow
+      parentID: string
+      show: boolean
+      children: SessionNode[]
+    }
+    const byID = new Map<string, any>()
+    for (const info of list) if (info?.id) byID.set(info.id, info)
+    const nodes = new Map<string, SessionNode>()
     for (const info of list) {
-      if (!info?.id || info.time?.archived) continue
+      if (!info?.id || info.time?.archived || nodes.has(info.id)) continue
       const needsInput = (props.api.state.sessionNeedsInput?.(info.id) ?? 0) > 0
       const status = props.api.state.sessionStatus?.(info.id)
       const busy = status === "running"
       const retry = status === "retry"
       const child = Boolean(info.parentID)
       // 已完成未读：这轮结果还没被看过（含子会话 —— "子任务跑完了"正是要提醒的）
-      const viewedAt = Math.max(Number(info.time?.viewed) || 0, locallyViewed.get(info.id) ?? 0)
+      // 子会话的"已看"跟随父会话：父会话界面被打开过，就算看过子任务的结果
+      const parentViewed = child ? Number(byID.get(info.parentID)?.time?.viewed) || 0 : 0
+      const viewedAt = Math.max(Number(info.time?.viewed) || 0, parentViewed, locallyViewed.get(info.id) ?? 0)
       const idleAt = Number(info.time?.idle) || 0
       const done = idleAt > viewedAt
       if (done) locallyViewed.delete(info.id)
@@ -1008,31 +1095,87 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
       else if (locallyViewed.has(info.id) && now - (locallyViewed.get(info.id) ?? 0) > idleWindowMs) {
         locallyViewed.delete(info.id)
       }
-      // 子会话只在真正干活/等人/刚跑完没看时才列出，避免刷屏
-      if (child && !needsInput && !busy && !retry && !done) continue
       // "最近活动"取 updated 和 viewed 的较新值：会话可能只是被打开看过、还没有新消息
       const updated = Math.max(Number(info.time?.updated) || 0, Number(info.time?.viewed) || 0)
       const idle = !needsInput && !busy && !retry
-      // 空闲会话保留：最近活跃/查看过的、当前正在看的、以及本窗口打开的标签页
-      // （已完成未读的也算"活跃"—— 它正等着被点开）
+      // 自身要不要列：子会话只在真正干活/等人/刚跑完没看时列出（避免刷屏）；
+      // 空闲会话保留条件是 最近活跃/查看过、当前正在看、本窗口打开的标签页，
+      // 或已完成未读（它正等着被点开）
       const openedHere = tabIDs.includes(info.id)
-      if (idle && !done && !openedHere && info.id !== currentID && now - updated > idleWindowMs) continue
+      const quietChild = child && !needsInput && !busy && !retry && !done
+      const tooOld = idle && !done && !openedHere && info.id !== currentID && now - updated > idleWindowMs
       const title = String(info.title ?? "").trim() || t.sessionUntitled
       const isCurrent = info.id === currentID
-      rows.push({
-        id: info.id,
-        title: child ? `└ ${title}` : title,
-        glyph: needsInput ? "?" : retry ? "↻" : busy ? "●" : done ? "✓" : "○",
-        color: needsInput || retry ? theme().warning : busy ? theme().accent : done ? theme().success : theme().textMuted,
-        // 待确认最显眼（warning），正在看的会话用强调色，空闲的整行淡掉
-        titleColor: needsInput ? theme().warning : isCurrent ? theme().accent : idle ? theme().textMuted : theme().text,
-        current: isCurrent,
-        busy,
-        rank: needsInput ? 4 : done ? 3 : busy || retry ? 2 : 1,
-        updated,
+      nodes.set(info.id, {
+        row: {
+          id: info.id,
+          title: child ? `└ ${title}` : title,
+          glyph: needsInput ? "?" : retry ? "↻" : busy ? "●" : done ? "✓" : "○",
+          color: needsInput || retry ? theme().warning : busy ? theme().accent : done ? theme().success : theme().textMuted,
+          // 待确认最显眼（warning），正在看的会话用强调色，空闲的整行淡掉
+          titleColor: needsInput ? theme().warning : isCurrent ? theme().accent : idle ? theme().textMuted : theme().text,
+          current: isCurrent,
+          busy,
+          rank: needsInput ? 4 : done ? 3 : busy || retry ? 2 : 1,
+          updated,
+          // "在干什么"子行：只在有进行中的工具调用时出现（开关见 sessionsToolActivity）
+          activity: showActivity ? props.api.state.sessionToolActivity?.(info.id) : undefined,
+        },
+        parentID: child ? String(info.parentID) : "",
+        show: !quietChild && !tooOld,
+        children: [],
       })
     }
-    rows.sort((a, b) => b.rank - a.rank || b.updated - a.updated)
+    // 子可见时沿祖先链上溯，把被过滤掉的父会话拉回来当上下文行，
+    // 保证"子会话挂在父会话正下方"；链长设上限，防御脏数据成环
+    const MAX_ANCESTOR_HOPS = 8
+    for (const node of nodes.values()) {
+      if (!node.show || !node.parentID) continue
+      let ancestor = nodes.get(node.parentID)
+      for (let hop = 0; ancestor && !ancestor.show && hop < MAX_ANCESTOR_HOPS; hop++) {
+        ancestor.show = true
+        ancestor = ancestor.parentID ? nodes.get(ancestor.parentID) : undefined
+      }
+    }
+    const tops: SessionNode[] = []
+    for (const node of nodes.values()) {
+      if (!node.show) continue
+      const parent = node.parentID ? nodes.get(node.parentID) : undefined
+      if (parent && parent.show && parent !== node) parent.children.push(node)
+      else tops.push(node)
+    }
+    // 汇总每个子树"最要紧的成员"：组间和组内都按（最高状态等级，最近更新时间）排
+    const stats = new Map<string, { rank: number; updated: number }>()
+    const statOf = (node: SessionNode, seen: Set<string>): { rank: number; updated: number } => {
+      let rank = node.row.rank
+      let updated = node.row.updated
+      for (const kid of node.children) {
+        if (seen.has(kid.row.id)) continue
+        seen.add(kid.row.id)
+        const sub = statOf(kid, seen)
+        rank = Math.max(rank, sub.rank)
+        updated = Math.max(updated, sub.updated)
+      }
+      const value = { rank, updated }
+      stats.set(node.row.id, value)
+      return value
+    }
+    for (const node of nodes.values()) if (node.show) statOf(node, new Set([node.row.id]))
+    const byGroup = (a: SessionNode, b: SessionNode) => {
+      const sa = stats.get(a.row.id) ?? { rank: a.row.rank, updated: a.row.updated }
+      const sb = stats.get(b.row.id) ?? { rank: b.row.rank, updated: b.row.updated }
+      return sb.rank - sa.rank || sb.updated - sa.updated
+    }
+    // 深度优先展开：父行在前、其子行紧随其后（子树带高优先级状态时整组上浮）
+    const rows: SessionRow[] = []
+    const emitted = new Set<string>()
+    const flatten = (node: SessionNode) => {
+      if (emitted.has(node.row.id)) return
+      emitted.add(node.row.id)
+      rows.push(node.row)
+      for (const kid of [...node.children].sort(byGroup)) flatten(kid)
+    }
+    for (const top of tops.sort(byGroup)) flatten(top)
     return rows
   })
 
@@ -1493,26 +1636,38 @@ return (
         </Show>
         <For each={visibleSessionRows()}>
           {(row) => (
-            <box
-              flexDirection="row"
-              gap={1}
-              onMouseDown={() => {
-                if (row.current) return
-                // 点开的那一下就把"已完成"符号收掉：打开后服务端会把 time.viewed
-                // 追平，符号自然变成 ○；先用本地记录顶一下，不用等轮询
-                markViewed(row.id)
-                if (!props.api.ui.openSession?.(row.id)) {
-                  props.api.ui.toast({ variant: "error", message: t.sessionOpenFailed })
-                }
-              }}
-            >
-              {/* 状态看行首符号 + 颜色：? 待确认（warning） / ↻ 重试中（warning）
-                  ● 运行中（accent，按帧呼吸） / ✓ 已完成未读（success，打开后变 ○）
-                  / ○ 空闲（muted）；行尾不再挂文字，避免被裁掉 */}
-              <text fg={row.color}>{row.busy ? BREATH_FRAMES[breathFrame() % BREATH_FRAMES.length] : row.glyph}</text>
-              <text fg={row.titleColor}>
-                {row.current ? "› " : "  "}{truncate(row.title, 18)}
-              </text>
+            <box flexDirection="column">
+              <box
+                flexDirection="row"
+                gap={1}
+                onMouseDown={() => {
+                  if (row.current) return
+                  // 点开的那一下就把"已完成"符号收掉（signal 驱动、即时生效），
+                  // 并由 openSession 内部向服务端补调 session.view 把 time.viewed
+                  // 写平 —— 所有窗口的 ✓ 都会随之变 ○，不只是本窗口"看起来"消掉了
+                  markViewed(row.id)
+                  if (!props.api.ui.openSession?.(row.id)) {
+                    props.api.ui.toast({ variant: "error", message: t.sessionOpenFailed })
+                  }
+                }}
+              >
+                {/* 状态看行首符号 + 颜色：? 待确认（warning） / ↻ 重试中（warning）
+                    ● 运行中（accent，按帧呼吸） / ✓ 已完成未读（success，打开后变 ○）
+                    / ○ 空闲（muted）；行尾不再挂文字，避免被裁掉 */}
+                <text fg={row.color}>{row.busy ? BREATH_FRAMES[breathFrame() % BREATH_FRAMES.length] : row.glyph}</text>
+                <text fg={row.titleColor}>
+                  {row.current ? "› " : "  "}{truncate(row.title, 18)}
+                </text>
+              </box>
+              {/* "正在干什么"子行：进行中的工具调用（$ 命令 / ✎ 文件 / ⚙ 工具名…），
+                  缩进到标题列；开关 sessionsToolActivity: false 可关掉 */}
+              <Show when={row.activity}>
+                <box paddingLeft={4}>
+                  <text fg={theme().textMuted}>
+                    {row.activity ? toolActivityLine(row.activity.name, row.activity.input, row.activity.extra) : ""}
+                  </text>
+                </box>
+              </Show>
             </box>
           )}
         </For>
@@ -1928,6 +2083,35 @@ function createTuiApi(context: any) {
     if (Date.now() - lastSessionsRefresh < 1000) return
     void refreshSessions()
   }
+  // 在会话快照里查一条会话（服务端列表优先，本地缓存兜底）
+  const findSessionInfo = (sessionID: string): any | undefined => {
+    const remote = serverSessions().find((info: any) => info?.id === sessionID)
+    if (remote) return remote
+    try {
+      return (context.data.session.list() ?? []).find((info: any) => info?.id === sessionID)
+    } catch {
+      return undefined
+    }
+  }
+  // 侧边栏点开某一行时，替它向服务端补记一次"已查看"（POST /api/session/:id/view，
+  // 把 observed 的 idle 时间戳交给服务端把 time.viewed 写平）。
+  // 必要性：主界面对话时只会给"它打开的那个根会话"调 view —— 点子会话行实际显示的是
+  // 父会话，子会话自己的 viewed 永远为空，✓ 就永远消不掉。服务端写平后会广播
+  // session.viewed 事件，其它窗口跟着刷新，✓ 在所有窗口同步变成 ○。
+  // 注意 v2.0.9 的插件类型里还没有 view 方法，运行时（v2.0.22）是存在的，防御式调用。
+  const markViewedOnServer = (sessionID: string) => {
+    const sessionClient = context.client.session as any
+    const view = sessionClient?.view
+    if (typeof view !== "function") return
+    const idleAt = Number(findSessionInfo(sessionID)?.time?.idle) || 0
+    if (!idleAt || idleAt > Date.now()) return
+    try {
+      void Promise.resolve(view.call(sessionClient, { sessionID, idle: idleAt })).catch(() => {})
+    } catch {
+      // 服务端不可用 / 会话已不存在时静默，本地乐观记录（locallyViewed）仍会兜住显示
+    }
+    scheduleSessionsRefresh()
+  }
   const trackPendingInput = (sessionID: unknown, id: unknown, add: boolean) => {
     if (typeof sessionID !== "string" || !sessionID) return
     const key = typeof id === "string" && id ? id : `${sessionID}:${pendingEventTotal++}`
@@ -1942,13 +2126,77 @@ function createTuiApi(context: any) {
     setRevision((value) => value + 1)
   }
 
+  // 会话正在跑什么：sessionID → 工具调用ID → { name, input, at }
+  // 事件流是全局的（跨窗口/跨目录），所以别的窗口里启动的会话也能看到。
+  // 数据来源：session.tool.input.started 带工具名（参数还在流式生成）、
+  // session.tool.called 带完整 input、session.tool.success/failed 结束该调用，
+  // session.idle / execution.* / deleted 兜底清空整个会话。
+  const toolActivity = new Map<string, Map<string, { name: string; input?: Record<string, unknown>; at: number }>>()
+  const setToolCall = (sessionID: unknown, callID: unknown, patch: { name?: unknown; input?: unknown }) => {
+    if (typeof sessionID !== "string" || !sessionID || typeof callID !== "string" || !callID) return
+    let calls = toolActivity.get(sessionID)
+    if (!calls) {
+      calls = new Map()
+      toolActivity.set(sessionID, calls)
+    }
+    const prev = calls.get(callID)
+    calls.set(callID, {
+      name: typeof patch.name === "string" && patch.name ? patch.name : prev?.name ?? "",
+      input: patch.input && typeof patch.input === "object" ? (patch.input as Record<string, unknown>) : prev?.input,
+      at: Date.now(),
+    })
+    // 防御上限：并行调用与脏数据都不该无限增长（只保留每会话最近 12 个、全局最近 64 个会话）
+    if (calls.size > 12) {
+      const byAge = [...calls.entries()].sort((a, b) => a[1].at - b[1].at)
+      for (const [staleID] of byAge.slice(0, byAge.length - 12)) calls.delete(staleID)
+    }
+    if (toolActivity.size > 64) {
+      let oldestID: string | undefined
+      let oldestAt = Infinity
+      for (const [sid, map] of toolActivity) {
+        for (const call of map.values()) {
+          if (call.at < oldestAt) {
+            oldestAt = call.at
+            oldestID = sid
+          }
+        }
+      }
+      if (oldestID && oldestID !== sessionID) toolActivity.delete(oldestID)
+    }
+    setRevision((value) => value + 1)
+  }
+  const endToolCall = (sessionID: unknown, callID: unknown) => {
+    if (typeof sessionID !== "string" || typeof callID !== "string" || !callID) return
+    const calls = toolActivity.get(sessionID)
+    if (!calls?.delete(callID)) return
+    if (!calls.size) toolActivity.delete(sessionID)
+    setRevision((value) => value + 1)
+  }
+  const clearToolActivity = (sessionID: unknown) => {
+    if (typeof sessionID === "string" && toolActivity.delete(sessionID)) setRevision((value) => value + 1)
+  }
+
   const stopListening = context.data.listen(({ details }: { details: any }) => {
     const event = details
     const payload = event?.data
+    const type = String(event?.type ?? "")
+    // 工具活动行：started/called 记录，success/failed 销账，idle/执行结束/删除 整体清空。
+    // 这些事件带 assistantMessageID，必须放在下面那个分支之前处理。
+    if (type === "session.tool.input.started") setToolCall(payload?.sessionID, payload?.id, { name: payload?.name })
+    else if (type === "session.tool.called") setToolCall(payload?.sessionID, payload?.id, { input: payload?.input })
+    else if (type === "session.tool.success" || type === "session.tool.failed") endToolCall(payload?.sessionID, payload?.id)
+    else if (
+      type === "session.idle" ||
+      type === "session.deleted" ||
+      type === "session.execution.succeeded" ||
+      type === "session.execution.failed" ||
+      type === "session.execution.interrupted"
+    ) {
+      clearToolActivity(payload?.sessionID)
+    }
     if (!payload?.assistantMessageID) {
       // 会话面板要跟着 session.* / permission.* / form.* 变化重绘，这些事件没有
       // assistantMessageID，所以单独判断（顺带覆盖 session.created / model.selected）
-      const type = String(event?.type ?? "")
       if (type.startsWith("session.") || type.startsWith("permission.") || type.startsWith("form.")) {
         // "需要用户操作"是全局事件，即使会话在别的窗口/目录也能统计到
         if (type === "permission.asked") trackPendingInput(payload?.sessionID, payload?.id, true)
@@ -2079,6 +2327,15 @@ function createTuiApi(context: any) {
         }
         return Math.max(local, serverPending()[sessionID] ?? 0, pendingEvents.get(sessionID)?.size ?? 0)
       },
+      // 该会话正在进行的工具调用：取最近开始的一个，extra 是其余还没结束的数量
+      // （并行调用时侧边栏会显示 "... +N"）
+      sessionToolActivity: (sessionID: string): { name: string; input?: Record<string, unknown>; extra: number } | undefined => {
+        const calls = toolActivity.get(sessionID)
+        if (!calls?.size) return undefined
+        let latest: { name: string; input?: Record<string, unknown>; at: number } | undefined
+        for (const call of calls.values()) if (!latest || call.at >= latest.at) latest = call
+        return latest && { name: latest.name, input: latest.input, extra: calls.size - 1 }
+      },
     },
     client: context.client,
     attention: context.attention,
@@ -2089,8 +2346,12 @@ function createTuiApi(context: any) {
         try {
           // Prefer native tabs: focus an existing tab or open it when needed.
           // If tabs are disabled, fall back to the session router.
-          if (context.ui.tabs.focus(sessionID)) return true
+          if (context.ui.tabs.focus(sessionID)) {
+            markViewedOnServer(sessionID)
+            return true
+          }
           context.ui.router.navigate({ type: "session", sessionID })
+          markViewedOnServer(sessionID)
           return true
         } catch {
           return false
@@ -2122,6 +2383,8 @@ const TuiPlugin = Plugin.define({
     // 会话面板 / 跨会话 Toast 可以用插件选项关掉（默认都开）
     const sessionsPanel = options.sessionsPanel !== false
     const sessionToasts = options.sessionToasts !== false
+    // 会话行下方"正在干什么"子行（工具活动），默认开，sessionsToolActivity: false 关掉
+    const sessionsToolActivity = options.sessionsToolActivity !== false
     // 空闲会话的保留窗口（分钟）：0 = 只列活跃/待确认/本窗口打开的会话，
     // 不配置则用默认值（SESSION_IDLE_WINDOW_MS，2 小时）
     const idleMinutes = Number(options.sessionsIdleMinutes)
@@ -2262,6 +2525,7 @@ const TuiPlugin = Plugin.define({
             lang={lang}
             showSessions={sessionsPanel}
             sessionsIdleMs={sessionsIdleMs}
+            showToolActivity={sessionsToolActivity}
           />
         )
       },
