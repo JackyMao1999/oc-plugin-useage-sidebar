@@ -1039,7 +1039,11 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
   //     ● 运行中（accent，符号带呼吸动画，见 BREATH_FRAMES）
   //     ✓ 已完成但还没打开看过（success 色 —— 用户点开该会话后符号变回 ○）
   //     ○ 空闲（muted，标题也淡掉）
-  //   树状：子会话（subagent，标题带 └ 前缀）永远跟在父会话行的下面；
+  //   树状：子会话（subagent）行**不显示运行状态**（主界面左侧的 subagent 面板
+  //   已经实时展示了它的进度/活动），符号列固定为灰色树形连接符 └，行的职责
+  //   只有一个：点击直接跳转到该子会话自己的界面（内置 TUI 支持打开子会话，
+  //   界面上有回父会话/切换上一个·下一个子会话的快捷键）。子会话何时"出现"
+  //   仍由自己的活跃程度决定（刚完成、在跑、待确认时列出，安静下来后过保留窗口消失）。
   //   排序按"组"进行 —— 组内状态最高的成员决定组的先后
   //   （待确认 > 已完成未读 > 运行中/重试 > 空闲），同组内再按最近更新时间。
   //   子会话可见但父会话本已被空闲窗口过滤掉时，把父会话拉回来当上下文行。
@@ -1127,17 +1131,40 @@ function UsageSidebar(props: { api: any; sessionId?: string; lang?: Lang; showSe
       nodes.set(info.id, {
         row: {
           id: info.id,
-          title: child ? `└ ${title}` : title,
-          glyph: needsInput ? "?" : retry ? "↻" : busy ? "●" : done ? "✓" : "○",
-          color: needsInput || retry ? theme().warning : busy ? theme().accent : done ? theme().success : theme().textMuted,
-          // 待确认最显眼（warning），正在看的会话用强调色，空闲的整行淡掉
-          titleColor: needsInput ? theme().warning : isCurrent ? theme().accent : idle ? theme().textMuted : theme().text,
+          // 子会话不显示运行状态：符号列固定灰色 └（主界面左侧已有 subagent
+          // 实时面板），这一行只当跳转入口；标题不再挂 "└" 前缀，避免和符号列重复
+          title,
+          glyph: child ? "└" : needsInput ? "?" : retry ? "↻" : busy ? "●" : done ? "✓" : "○",
+          color: child
+            ? theme().textMuted
+            : needsInput || retry
+              ? theme().warning
+              : busy
+                ? theme().accent
+                : done
+                  ? theme().success
+                  : theme().textMuted,
+          // 待确认最显眼（warning），正在看的会话用强调色，空闲的整行淡掉；
+          // 子会话整行固定淡色（当前正停在它的界面时用强调色）
+          titleColor: child
+            ? isCurrent
+              ? theme().accent
+              : theme().textMuted
+            : needsInput
+              ? theme().warning
+              : isCurrent
+                ? theme().accent
+                : idle
+                  ? theme().textMuted
+                  : theme().text,
           current: isCurrent,
-          busy,
+          // 呼吸动画只给父会话的行；子会话即便在跑也按静态 └ 显示
+          busy: child ? false : busy,
           rank: needsInput ? 4 : done ? 3 : busy || retry ? 2 : 1,
           updated,
-          // "在干什么"子行：只在有进行中的工具调用时出现（开关见 sessionsToolActivity）
-          activity: showActivity ? props.api.state.sessionToolActivity?.(info.id) : undefined,
+          // "在干什么"子行：只在有进行中的工具调用时出现（开关见 sessionsToolActivity）；
+          // 子会话不挂（属于运行状态展示，且会跟父会话的 task 子行重复）
+          activity: showActivity && !child ? props.api.state.sessionToolActivity?.(info.id) : undefined,
         },
         parentID: child ? String(info.parentID) : "",
         show: !quietChild && !tooOld,
@@ -1711,7 +1738,9 @@ return (
               >
                 {/* 状态看行首符号 + 颜色：? 待确认（warning） / ↻ 重试中（warning）
                     ● 运行中（accent，按帧呼吸） / ✓ 已完成未读（success，打开后变 ○）
-                    / ○ 空闲（muted）；行尾不再挂文字，避免被裁掉 */}
+                    / ○ 空闲（muted）；└ 是子会话（subagent）行：不显示运行状态
+                    （主界面左侧已有实时 subagent 面板），点击直接跳到子会话界面；
+                    行尾不再挂文字，避免被裁掉 */}
                 <text fg={row.color}>{row.busy ? BREATH_FRAMES[breathFrame() % BREATH_FRAMES.length] : row.glyph}</text>
                 <text fg={row.titleColor}>
                   {row.current ? "› " : "  "}{truncate(row.title, 18)}
@@ -2153,8 +2182,9 @@ function createTuiApi(context: any) {
   }
   // 侧边栏点开某一行时，替它向服务端补记一次"已查看"（POST /api/session/:id/view，
   // 把 observed 的 idle 时间戳交给服务端把 time.viewed 写平）。
-  // 必要性：主界面对话时只会给"它打开的那个根会话"调 view —— 点子会话行实际显示的是
-  // 父会话，子会话自己的 viewed 永远为空，✓ 就永远消不掉。服务端写平后会广播
+  // 必要性：主界面不一定会对被点的这一行调 view（子会话历史上 viewed 永远为空、
+  // ✓ 消不掉；如今侧边栏直接把子会话界面打开，view 由谁负责仍不可依赖）。
+  // 补一刀能保证：不管点的是父会话还是子会话，viewed 在服务端写平后会广播
   // session.viewed 事件，其它窗口跟着刷新，✓ 在所有窗口同步变成 ○。
   // 注意 v2.0.9 的插件类型里还没有 view 方法，运行时（v2.0.22）是存在的，防御式调用。
   const markViewedOnServer = (sessionID: string) => {
